@@ -11,6 +11,12 @@
 #include "rva/RVA.h"
 #include "minhook/include/MinHook.h"
 
+// for getting the caller
+#include <intrin.h>
+#include <cstdint>
+#include <cstdio>
+#include <windows.h>
+#include <mutex>
 
 #define INI_LOCATION "./mods/smart-dice-rolls-mod.ini"
 
@@ -19,6 +25,300 @@ Config g_config;
 Logger g_logger;
 HMODULE g_bg3BaseAddr = nullptr;
 static uintptr_t g_base = 0;
+
+// helper functions for dumping bytes from functions to create
+// signatures
+
+static void DumpBytes(const char* name, const void* addr, size_t count)
+{
+    auto p = reinterpret_cast<const uint8_t*>(addr);
+
+    char line[512]{};
+    size_t pos = 0;
+
+    pos += snprintf(line + pos, sizeof(line) - pos, "%s at %p:", name, addr);
+
+    for (size_t i = 0; i < count && pos + 4 < sizeof(line); ++i) {
+        pos += snprintf(line + pos, sizeof(line) - pos, " %02X", p[i]);
+    }
+
+    _LOG("%s", line);
+}
+
+// roll structure and helpers
+enum class RollMode : uint8_t {
+    Normal,
+    Advantage,
+    Disadvantage,
+    Unknown
+};
+
+static RollMode GetModeFromFlags(uint8_t flags10, uint8_t outAdv, uint8_t outDis)
+{
+    if (flags10 & 0x10) return RollMode::Advantage;
+    if (flags10 & 0x20) return RollMode::Disadvantage;
+    if (outAdv) return RollMode::Advantage;
+    if (outDis) return RollMode::Disadvantage;
+    return RollMode::Normal;
+}
+
+static const char* RollModeName(RollMode m)
+{
+    switch (m) {
+    case RollMode::Normal:       return "normal";
+    case RollMode::Advantage:    return "advantage";
+    case RollMode::Disadvantage: return "disadvantage";
+    default:                     return "unknown";
+    }
+}
+
+#pragma pack(push, 1)
+
+struct SmallRollData
+{
+    uint32_t total;          // +0x00  likely final total
+    uint32_t keptDie;        // +0x04  likely main/kept die
+    uint32_t otherDie;       // +0x08  other roll-related value / second die slot
+    uint8_t  state;          // +0x0C  phase/state byte
+    uint8_t  pad0D[3];
+    uint64_t packedDiceInfo; // +0x10  low32 looks like die type (20 => d20)
+    uint64_t extraPtr;       // +0x18
+    uint32_t extraCap;       // +0x20
+    uint32_t extraCount;     // +0x24
+};
+
+struct DialogueRollOutput
+{
+    uint8_t  hdr00;              // +0x00 unknown
+    uint8_t  hdr01;              // +0x01 unknown
+    uint8_t  hdr02;              // +0x02 unknown
+    uint8_t  hdr03;              // +0x03 unknown
+    uint32_t hdr04;              // +0x04 unknown
+    uint32_t hdr08;              // +0x08 unknown
+    uint8_t  uiFlags;            // +0x0C usually 8 in your logs
+    uint8_t  isAdvantageFlag;    // +0x0D written from param10 bit 0x10
+    uint8_t  isDisadvantageFlag; // +0x0E written from param10 bit 0x20
+    uint8_t  hdr0F;              // +0x0F unknown
+    uint8_t  unk10_1F[0x10];     // +0x10..+0x1F filled by FUN_140e732b0
+    SmallRollData roll;          // +0x20 copied by FUN_140e72c30
+};
+
+#pragma pack(pop)
+
+static_assert(sizeof(SmallRollData) == 0x28, "SmallRollData size mismatch");
+static_assert(offsetof(DialogueRollOutput, roll) == 0x20, "DialogueRollOutput.roll offset mismatch");
+
+struct RollSummary
+{
+    RollMode mode;
+    uint32_t dcOrTarget;
+    uint32_t total;
+    uint32_t keptDie;
+    uint32_t otherDie;
+    uint8_t  state;
+    uint32_t dieType;
+};
+
+static RollSummary g_lastSummary{ RollMode::Unknown, 0, 0, 0, 0, 0, 0 };
+
+static bool SameSummary(const RollSummary& a, const RollSummary& b)
+{
+    return a.mode      == b.mode &&
+           a.dcOrTarget == b.dcOrTarget &&
+           a.total     == b.total &&
+           a.keptDie   == b.keptDie &&
+           a.otherDie  == b.otherDie &&
+           a.state     == b.state &&
+           a.dieType   == b.dieType;
+}
+
+enum class RollCopyStage : uint8_t {
+    Unknown = 0,
+    UpstreamBuild,
+    DownstreamPropagate
+};
+
+static const char* RollCopyStageName(RollCopyStage s)
+{
+    switch (s) {
+    case RollCopyStage::UpstreamBuild:      return "upstream-build";
+    case RollCopyStage::DownstreamPropagate:return "downstream-propagate";
+    default:                                return "unknown";
+    }
+}
+
+#pragma pack(push, 1)
+struct RollCopyData
+{
+    uint32_t total;          // +0x00 visible/result total
+    uint32_t keptDie;        // +0x04 primary/kept die
+    uint32_t otherDie;       // +0x08 secondary/discarded/aux value
+    uint8_t  state;          // +0x0C
+    uint8_t  pad0D[3];
+    uint64_t packedDiceInfo; // +0x10 low32 == 20 for d20
+    uint64_t extraPtr;       // +0x18
+    uint32_t extraCap;       // +0x20
+    uint32_t extraCount;     // +0x24
+};
+#pragma pack(pop)
+
+static_assert(sizeof(RollCopyData) == 0x28, "RollCopyData size mismatch");
+
+struct RollCopySummary
+{
+    RollCopyStage stage;
+    uint32_t total;
+    uint32_t keptDie;
+    uint32_t otherDie;
+    uint8_t  state;
+    uint32_t dieType;
+    uint32_t packedHi;
+};
+
+static RollCopySummary g_lastRollCopy{};
+
+static uint32_t ReadU32(const void* p, size_t off)
+{
+    return *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const uint8_t*>(p) + off);
+}
+
+static uint64_t ReadU64(const void* p, size_t off)
+{
+    return *reinterpret_cast<const uint64_t*>(
+        reinterpret_cast<const uint8_t*>(p) + off);
+}
+
+static bool SameRollCopy(const RollCopySummary& a, const RollCopySummary& b)
+{
+    return a.stage   == b.stage &&
+           a.total   == b.total &&
+           a.keptDie == b.keptDie &&
+           a.otherDie== b.otherDie &&
+           a.state   == b.state &&
+           a.dieType == b.dieType &&
+           a.packedHi== b.packedHi;
+}
+
+static RollCopyStage ClassifyRollCopyCaller(void* caller)
+{
+    uintptr_t c = reinterpret_cast<uintptr_t>(caller);
+
+    // Current-build friendly labels from your logs
+    if (c == g_base + 0x1185950) return RollCopyStage::UpstreamBuild;       // 0x...FAC5950
+    if (c == g_base + 0x0F153A8) return RollCopyStage::DownstreamPropagate; // 0x...F8553A8
+
+    return RollCopyStage::Unknown;
+}
+
+static bool TrySummarizeRollCopy(const void* obj, void* caller, RollCopySummary& out)
+{
+    if (!obj) return false;
+
+    const auto* roll = reinterpret_cast<const RollCopyData*>(obj);
+
+    uint32_t dieType = static_cast<uint32_t>(roll->packedDiceInfo & 0xFFFFFFFFull);
+    uint32_t packedHi = static_cast<uint32_t>(roll->packedDiceInfo >> 32);
+
+    if (dieType != 20) return false; // focus on d20 only
+
+    out = RollCopySummary{
+        ClassifyRollCopyCaller(caller),
+        roll->total,
+        roll->keptDie,
+        roll->otherDie,
+        roll->state,
+        dieType,
+        packedHi
+    };
+
+    if (SameRollCopy(out, g_lastRollCopy)) return false;
+    g_lastRollCopy = out;
+    return true;
+}
+
+static void PrintRollCopySummary(const RollCopySummary& s, void* caller)
+{
+    _LOG("[BG3] roll-copy: stage=%s caller=%p total=%u kept=%u other=%u state=%u dieType=d%u packedHi=0x%08X",
+        RollCopyStageName(s.stage),
+        caller,
+        s.total,
+        s.keptDie,
+        s.otherDie,
+        (unsigned)s.state,
+        s.dieType,
+        s.packedHi);
+}
+
+// Physical (smart) dice structures and functions
+
+struct PendingPhysicalRoll
+{
+    bool valid = false;
+    RollMode mode = RollMode::Unknown;
+    uint32_t dc = 0;
+
+    // For normal: use die1 only.
+    // For advantage/disadvantage: use die1 and die2.
+    uint32_t die1 = 0;
+    uint32_t die2 = 0;
+};
+
+static std::mutex g_rollMutex;
+static PendingPhysicalRoll g_pendingRoll{};
+
+static bool IsD20(const RollCopyData* r)
+{
+    return r && static_cast<uint32_t>(r->packedDiceInfo & 0xFFFFFFFFull) == 20;
+}
+
+static uint32_t ClampD20(uint32_t x)
+{
+    if (x < 1) return 1;
+    if (x > 20) return 20;
+    return x;
+}
+
+static void ApplyPhysicalRollOverride(RollCopyData* r, const PendingPhysicalRoll& p)
+{
+    if (!r || !p.valid) return;
+
+    uint32_t kept = 0;
+    uint32_t other = r->otherDie;
+
+    uint32_t d1 = ClampD20(p.die1);
+    uint32_t d2 = ClampD20(p.die2);
+
+    switch (p.mode) {
+    case RollMode::Advantage:
+        kept = (d1 >= d2) ? d1 : d2;
+        other = (d1 >= d2) ? d2 : d1;
+        break;
+
+    case RollMode::Disadvantage:
+        kept = (d1 <= d2) ? d1 : d2;
+        other = (d1 <= d2) ? d2 : d1;
+        break;
+
+    case RollMode::Normal:
+        kept = d1;
+        // keep existing otherDie unless you learn a better meaning for it
+        break;
+
+    default:
+        return;
+    }
+
+    // Preserve whatever bonus/modifier pipeline the game already computed.
+    int32_t bonus = static_cast<int32_t>(r->total) - static_cast<int32_t>(r->keptDie);
+
+    r->keptDie = kept;
+    if (p.mode != RollMode::Normal) {
+        r->otherDie = other;
+    }
+    r->total = static_cast<uint32_t>(static_cast<int32_t>(kept) + bonus);
+}
+
 
 // Game functions
 
@@ -45,6 +345,12 @@ void FUN_1410acc10(longlong *param_1,undefined8 param_2,undefined8 param_3,undef
 
 using _ecl__GameStateMachine__Update = void(__fastcall*)(void *self, void *tick);
 using _RollCopy = void* (__fastcall*)(void* dst, const void* src);
+using _FUN_1411855f0 = void(__fastcall*)(
+    uintptr_t a1,  uintptr_t a2,  uintptr_t a3,  uintptr_t a4,
+    uintptr_t a5,  uintptr_t a6,  uintptr_t a7,  uintptr_t a8,
+    uintptr_t a9,  uintptr_t a10, uintptr_t a11, uintptr_t a12,
+    uintptr_t a13, uintptr_t a14, uintptr_t a15
+);
 
 
 
@@ -63,6 +369,14 @@ ecl__GameStateMachine__Update (
     "48 33 C4 "
 );
 _ecl__GameStateMachine__Update ecl__GameStateMachine__Update_Original = nullptr;
+
+
+RVA<_FUN_1411855f0>
+FUN_1411855f0(
+    "4C 89 4C 24 20 4C 89 44 24 18 55 53 56 57 "
+    "41 54 41 55 41 56 41 57 48 8D AC 24 E8 FE FF FF"
+);
+_FUN_1411855f0 FUN_1411855f0_Original = nullptr;
 
 RVA<_RollCopy>
 RollCopy (
@@ -125,9 +439,15 @@ namespace SmartDiceRolls {
             RollCopy.GetUIntPtr()
         );
 
+
+        _LOG("FUN_1411855f0 at %p",
+            FUN_1411855f0.GetUIntPtr()
+        );
+
         if (
             !ecl__GameStateMachine__Update ||
-            !RollCopy
+            !RollCopy ||
+            !FUN_1411855f0
         ) return false;
 
         if (!g_bg3BaseAddr) {
@@ -181,82 +501,234 @@ void ecl__GameStateMachine__Update_Hook(void* self, void* tick)
 using _RollCopy = void* (__fastcall*)(void* dst, const void* src);
 _RollCopy RollCopy_Original = nullptr;
 
-// helpers here
-static uint32_t ReadU32(const void* p, size_t off)
+static bool IsDownstreamCaller(void* caller)
 {
-    return *reinterpret_cast<const uint32_t*>(
-        reinterpret_cast<const uint8_t*>(p) + off);
-}
-
-static uint64_t ReadU64(const void* p, size_t off)
-{
-    return *reinterpret_cast<const uint64_t*>(
-        reinterpret_cast<const uint8_t*>(p) + off);
-}
-
-static uint8_t ReadU8(const void* p, size_t off)
-{
-    return *reinterpret_cast<const uint8_t*>(
-        reinterpret_cast<const uint8_t*>(p) + off);
-}
-
-struct RollSig {
-    uint32_t a00;
-    uint32_t a04;
-    uint32_t a08;
-    uint8_t  a0C;
-    uint64_t a10;
-};
-
-static RollSig g_last{};
-
-static bool SameSig(const RollSig& x, const RollSig& y)
-{
-    return x.a00 == y.a00 &&
-           x.a04 == y.a04 &&
-           x.a08 == y.a08 &&
-           x.a0C == y.a0C &&
-           x.a10 == y.a10;
-}
-
-static void LogInterestingRoll(const void* obj)
-{
-    if (!obj) return;
-
-    RollSig s{
-        ReadU32(obj, 0x00),
-        ReadU32(obj, 0x04),
-        ReadU32(obj, 0x08),
-        ReadU8 (obj, 0x0C),
-        ReadU64(obj, 0x10)
-    };
-
-    uint32_t low10 = (uint32_t)(s.a10 & 0xFFFFFFFFull);
-
-    if (low10 != 20) return; // only d20
-    if (SameSig(s, g_last)) return;
-    g_last = s;
-
-    if (s.a08 == 9 && s.a0C == 0) {
-        _LOG("[BG3] roll prompt: target=%u needed=%u packed=%016llX",
-            s.a00, s.a04, (unsigned long long)s.a10);
-    } else if (s.a08 == 4 && s.a0C == 1) {
-        _LOG("[BG3] roll resolved: total=%u keptDie=%u packed=%016llX",
-            s.a00, s.a04, (unsigned long long)s.a10);
-    } else {
-        _LOG("[BG3] roll state: +00=%u +04=%u +08=%u +0C=%u +10=%016llX",
-            s.a00, s.a04, s.a08, s.a0C, (unsigned long long)s.a10);
-    }
+    return reinterpret_cast<uintptr_t>(caller) == g_base + 0x0F153A8; // current-build F8553A8
 }
 
 void* __fastcall RollCopy_Hook(void* dst, const void* src)
 {
+    void* realCaller = _ReturnAddress();
+
     void* ret = RollCopy_Original(dst, src);
 
-    // for a copy helper, inspect the destination after the copy
-    LogInterestingRoll(ret ? ret : dst);
+    const void* obj = ret ? ret : dst;
+
+    RollCopySummary s{};
+    if (TrySummarizeRollCopy(obj, realCaller, s)) {
+        PrintRollCopySummary(s, realCaller);
+    }
 
     return ret;
+}
+
+
+#if 0
+void* __fastcall RollCopy_Hook(void* dst, const void* src)
+{
+    void* caller = _ReturnAddress();
+    void* ret = RollCopy_Original(dst, src);
+
+    auto* roll = reinterpret_cast<RollCopyData*>(ret ? ret : dst);
+    if (!roll || !IsD20(roll) || !IsDownstreamCaller(caller)) {
+        return ret;
+    }
+
+    PendingPhysicalRoll pending;
+    {
+        std::lock_guard<std::mutex> lock(g_rollMutex);
+        pending = g_pendingRoll;
+    }
+
+    pending.die1 = 8;
+    pending.die2 = 16;
+    pending.valid = true;
+
+    if (pending.valid) {
+        uint32_t beforeTotal = roll->total;
+        uint32_t beforeKept  = roll->keptDie;
+        uint32_t beforeOther = roll->otherDie;
+
+        ApplyPhysicalRollOverride(roll, pending);
+
+        _LOG("[BG3] applied physical roll: mode=%u before(total=%u kept=%u other=%u) after(total=%u kept=%u other=%u)",
+            static_cast<unsigned>(pending.mode),
+            beforeTotal, beforeKept, beforeOther,
+            roll->total, roll->keptDie, roll->otherDie);
+
+        // consume once
+        std::lock_guard<std::mutex> lock(g_rollMutex);
+        g_pendingRoll.valid = false;
+    }
+
+    const void* obj = ret ? ret : dst;
+
+    RollCopySummary s{};
+    if (TrySummarizeRollCopy(obj, caller, s)) {
+        PrintRollCopySummary(s, caller);
+    }
+
+    return ret;
+}
+
+
+void __fastcall FUN_1411855f0_Hook(
+    uintptr_t a1,  uintptr_t a2,  uintptr_t a3,  uintptr_t a4,
+    uintptr_t a5,  uintptr_t a6,  uintptr_t a7,  uintptr_t a8,
+    uintptr_t a9,  uintptr_t a10, uintptr_t a11, uintptr_t a12,
+    uintptr_t a13, uintptr_t a14, uintptr_t a15)
+{
+    auto param10 = reinterpret_cast<const uint8_t*>(a10);
+    auto out     = reinterpret_cast<DialogueRollOutput*>(a15);
+
+    uint8_t flags10 = param10 ? *param10 : 0;
+    uint32_t dcOrTarget = a6 ? *reinterpret_cast<uint32_t*>(a6 + 0xD4) : 0;
+
+    FUN_1411855f0_Original(
+        a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15
+    );
+
+    if (!out)
+        return;
+
+    uint32_t dieType = static_cast<uint32_t>(out->roll.packedDiceInfo & 0xFFFFFFFFull);
+    if (dieType != 20) // only d20 for now
+        return;
+
+    // after original, once you have output flags and dc
+    RollMode mode = GetModeFromFlags(flags10, out->isAdvantageFlag, out->isDisadvantageFlag);
+    uint32_t difficultyClass = *reinterpret_cast<uint32_t*>(a6 + 0xD4);
+
+    // send to tray app here
+    // e.g. localhost UDP / named pipe / HTTP:
+    // { "type":"roll_prompt", "mode":"advantage", "dc":10 }
+
+    {
+        std::lock_guard<std::mutex> lock(g_rollMutex);
+        g_pendingRoll.valid = false; // wait for tray app to fill it
+        g_pendingRoll.mode = mode;
+        g_pendingRoll.dc = difficultyClass;
+    }
+
+    RollSummary s{
+        mode,
+        dcOrTarget,
+        out->roll.total,
+        out->roll.keptDie,
+        out->roll.otherDie,
+        out->roll.state,
+        dieType
+    };
+
+    if (SameSummary(s, g_lastSummary))
+        return;
+
+    g_lastSummary = s;
+
+    _LOG("[BG3] dialogue roll: mode=%s flags=0x%02X outAdv=%u outDis=%u dc=%u total=%u kept=%u other=%u state=%u dieType=d%u",
+        RollModeName(mode),
+        flags10,
+        (unsigned)out->isAdvantageFlag,
+        (unsigned)out->isDisadvantageFlag,
+        s.dcOrTarget,
+        s.total,
+        s.keptDie,
+        s.otherDie,
+        (unsigned)s.state,
+        s.dieType);
+}
+#endif
+void __fastcall FUN_1411855f0_Hook(
+    uintptr_t a1,  uintptr_t a2,  uintptr_t a3,  uintptr_t a4,
+    uintptr_t a5,  uintptr_t a6,  uintptr_t a7,  uintptr_t a8,
+    uintptr_t a9,  uintptr_t a10, uintptr_t a11, uintptr_t a12,
+    uintptr_t a13, uintptr_t a14, uintptr_t a15)
+{
+    auto param10 = reinterpret_cast<const uint8_t*>(a10);
+    auto out     = reinterpret_cast<DialogueRollOutput*>(a15);
+
+    uint8_t flags10 = param10 ? *param10 : 0;
+
+    FUN_1411855f0_Original(
+        a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15
+    );
+
+    if (!out)
+        return;
+
+    uint32_t dieType = static_cast<uint32_t>(out->roll.packedDiceInfo & 0xFFFFFFFFull);
+    if (dieType != 20)
+        return;
+
+    RollMode mode = GetModeFromFlags(flags10, out->isAdvantageFlag, out->isDisadvantageFlag);
+    uint32_t difficultyClass = a6 ? *reinterpret_cast<uint32_t*>(a6 + 0xD4) : 0;
+
+    // Update prompt metadata only.
+    {
+        std::lock_guard<std::mutex> lock(g_rollMutex);
+        g_pendingRoll.mode = mode;
+        g_pendingRoll.dc = difficultyClass;
+    }
+
+    // Patch only the real result object, not the pre-roll/internal one.
+    if (out->roll.state == 0) {
+        PendingPhysicalRoll pending;
+        {
+            std::lock_guard<std::mutex> lock(g_rollMutex);
+            pending = g_pendingRoll;
+        }
+
+        // TEMP TEST VALUES
+        pending.die1 = 8;
+        pending.die2 = 16;
+        pending.valid = true;
+
+        if (pending.valid) {
+            uint32_t beforeTotal = out->roll.total;
+            uint32_t beforeKept  = out->roll.keptDie;
+            uint32_t beforeOther = out->roll.otherDie;
+
+            ApplyPhysicalRollOverride(reinterpret_cast<RollCopyData*>(&out->roll), pending);
+
+            _LOG("[BG3] applied physical roll in FUN_1411855f0: mode=%s dc=%u before(total=%u kept=%u other=%u state=%u) after(total=%u kept=%u other=%u state=%u)",
+                RollModeName(pending.mode),
+                pending.dc,
+                beforeTotal, beforeKept, beforeOther, (unsigned)out->roll.state,
+                out->roll.total, out->roll.keptDie, out->roll.otherDie, (unsigned)out->roll.state);
+
+            {
+                std::lock_guard<std::mutex> lock(g_rollMutex);
+                g_pendingRoll.valid = false;
+            }
+        }
+    }
+
+    RollSummary s{
+        mode,
+        difficultyClass,
+        out->roll.total,
+        out->roll.keptDie,
+        out->roll.otherDie,
+        out->roll.state,
+        dieType
+    };
+
+    if (SameSummary(s, g_lastSummary))
+        return;
+
+    g_lastSummary = s;
+
+    _LOG("[BG3] dialogue roll: mode=%s flags=0x%02X outAdv=%u outDis=%u dc=%u total=%u kept=%u other=%u state=%u dieType=d%u",
+        RollModeName(mode),
+        flags10,
+        (unsigned)out->isAdvantageFlag,
+        (unsigned)out->isDisadvantageFlag,
+        s.dcOrTarget,
+        s.total,
+        s.keptDie,
+        s.otherDie,
+        (unsigned)s.state,
+        s.dieType);
 }
 
 #if 0
@@ -315,6 +787,7 @@ void* __fastcall RollCopy_Hook(void* dst, const void* src)
             return false;
         }
 
+#if 0
         MH_CreateHook (
             RollCopy,
             RollCopy_Hook,
@@ -322,6 +795,17 @@ void* __fastcall RollCopy_Hook(void* dst, const void* src)
         );
         if (MH_EnableHook(RollCopy) != MH_OK) {
             _LOG("FATAL: Failed to install RollCopy hook.");
+            return false;
+        }
+#endif
+
+        MH_CreateHook (
+            FUN_1411855f0,
+            FUN_1411855f0_Hook,
+            reinterpret_cast<LPVOID *>(&FUN_1411855f0_Original)
+        );
+        if (MH_EnableHook(FUN_1411855f0) != MH_OK) {
+            _LOG("FATAL: Failed to install FUN_1411855f0 hook.");
             return false;
         }
 
@@ -368,6 +852,9 @@ void* __fastcall RollCopy_Hook(void* dst, const void* src)
             _LOG("FATAL: Incompatible version");
             return;
         }
+
+        //uintptr_t fac5950 = g_base + 0x1185950;
+        //DumpBytes("FAC5950", reinterpret_cast<void*>(fac5950), 32);
 
         _LOG("Ready.");
     }
