@@ -388,6 +388,8 @@ using _ResolveDialogueRoll = void(__fastcall*)( //FUN_14328e080
     char isReplayOrUiFlag       // param_4
 );
 
+using _Reroll = void(__fastcall *)(long long a1);
+
     //"48 8b 3d ? ? ? ? 48 8b d3 48 8b 8f 98 00 00 00"
 
     //"48 89 5c 24 18 55 56 57 41 54 41 55 41 56 41 57 "
@@ -426,6 +428,13 @@ ResolveDialogueRoll (
     "29 b4 24"
 );
 _ResolveDialogueRoll ResolveDialogueRoll_Original = nullptr;
+
+
+RVA<_Reroll>
+Reroll (
+    "40 53 48 83 ec 20 80 b9 28 09 00 00 00 48 8b d9 74 57"
+);
+_Reroll Reroll_Original = nullptr;
 
 static const char* GetClientStateName(uint32_t s)
 {
@@ -486,6 +495,10 @@ namespace SmartDiceRolls {
             ResolveDialogueRoll.GetUIntPtr()
         );
 
+        _LOG("Reroll at %p",
+            Reroll.GetUIntPtr()
+        );
+
         _LOG("FUN_1411855f0 at %p",
             FUN_1411855f0.GetUIntPtr()
         );
@@ -494,7 +507,8 @@ namespace SmartDiceRolls {
             !ecl__GameStateMachine__Update ||
             !RollCopy ||
             !FUN_1411855f0 ||
-            !ResolveDialogueRoll
+            !ResolveDialogueRoll ||
+            !Reroll
         ) return false;
 
         if (!g_bg3BaseAddr) {
@@ -567,6 +581,12 @@ void* __fastcall RollCopy_Hook(void* dst, const void* src)
     }
 
     return ret;
+}
+
+void Reroll_Hook (long long a1)
+{
+    _LOG("Reroll hook");
+    Reroll_Original(a1);
 }
 
 void ResolveDialogueRoll_Hook ( 
@@ -838,6 +858,16 @@ void __fastcall FUN_1411855f0_Hook(
         );
         if (MH_EnableHook(ResolveDialogueRoll) != MH_OK) {
             _LOG("FATAL: Failed to install ResolveDialogueRoll hook.");
+            return false;
+        }
+
+        MH_CreateHook (
+            Reroll,
+            Reroll_Hook,
+            reinterpret_cast<LPVOID *>(&Reroll_Original)
+        );
+        if (MH_EnableHook(Reroll) != MH_OK) {
+            _LOG("FATAL: Failed to install Reroll hook.");
             return false;
         }
 
