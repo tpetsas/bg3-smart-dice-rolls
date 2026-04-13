@@ -47,22 +47,39 @@ static const char* RollModeName(RollMode m)
     }
 }
 
+// clamp the value into the valid d20 range
+static uint32_t ClampD20(uint32_t x)
+{
+    if (x < 1) return 1;
+    if (x > 20) return 20;
+    return x;
+}
+
+struct SmartDiceResult
+{
+    bool ready = false;          // tray app has provided a result
+    uint32_t generation = 0;     // which dialogue-roll attempt this belongs to
+
+    uint32_t die1 = 0;           // normal: use die1 only
+    uint32_t die2 = 0;           // advantage/disadvantage: second die
+};
+
 struct DialogueRollSession
 {
-    bool active = false;          // saw uiFlag=1
-    bool waitingForResolution = false;
-    bool rerollPending = false;   // saw Reroll_Hook
-    uint32_t generation = 0;
+    bool active = false;               // we are inside a dialogue-roll lifecycle
+    bool waitingForResolution = false; // waiting for the followup uiFlag==0 call
+    bool rerollPending = false;        // player clicked Roll Again (this triggers our Reroll_Hook)
+    uint32_t generation = 0;           // increments per attempt
 
     RollMode mode = RollMode::Unknown;
     uint32_t dc = 0;
     int32_t modifier = 0;
-    int64_t lastPromptState = 0;
 };
 
 
 static std::mutex g_dialogueRollMutex;
 static DialogueRollSession g_dialogueRoll{}; // all initialized to zero
+static SmartDiceResult g_smartDiceResult{};
 
 static void ResetDialogueRollSession()
 {
@@ -72,7 +89,6 @@ static void ResetDialogueRollSession()
     g_dialogueRoll.mode = RollMode::Unknown;
     g_dialogueRoll.dc = 0;
     g_dialogueRoll.modifier = 0;
-    g_dialogueRoll.lastPromptState = 0;
 }
 
 
@@ -139,12 +155,6 @@ using _ResolveDialogueRoll = void(__fastcall*)( //FUN_14328e080
 
 using _Reroll = void(__fastcall *)(long long a1);
 
-    //"48 8b 3d ? ? ? ? 48 8b d3 48 8b 8f 98 00 00 00"
-
-    //"48 89 5c 24 18 55 56 57 41 54 41 55 41 56 41 57 "
-    //"48 8d ac 24 80 fd ff ff 48 81 ec 80 03 00 00 48 "
-    //"8b 05 5a aa 6b 04 48 33 c4"
-
 RVA<_ResolveDialogueRoll>
 ResolveDialogueRoll (
     "48 89 5c 24 20 55 56 57 41 54 41 55 41 56 41 57 "
@@ -159,46 +169,6 @@ Reroll (
     "40 53 48 83 ec 20 80 b9 28 09 00 00 00 48 8b d9 74 57"
 );
 _Reroll Reroll_Original = nullptr;
-
-static const char* GetClientStateName(uint32_t s)
-{
-    switch (s) {
-    case 0: return "Unknown";
-    case 1: return "Init";
-    case 2: return "InitMenu";
-    case 3: return "InitNetwork";
-    case 4: return "InitConnection";
-    case 5: return "Idle";
-    case 6: return "LoadMenu";
-    case 7: return "Menu";
-    case 8: return "Exit";
-    case 9: return "SwapLevel";
-    case 10: return "LoadLevel";
-    case 11: return "LoadModule";
-    case 12: return "LoadSession";
-    case 13: return "UnloadLevel";
-    case 14: return "UnloadModule";
-    case 15: return "UnloadSession";
-    case 16: return "Paused";
-    case 17: return "PrepareRunning";
-    case 18: return "Running";
-    case 19: return "Disconnect";
-    case 20: return "Join";
-    case 21: return "Save";
-    case 22: return "StartLoading";
-    case 23: return "StopLoading";
-    case 24: return "StartServer";
-    case 25: return "Movie";
-    case 26: return "Installation";
-    case 27: return "ModReceiving";
-    case 28: return "Lobby";
-    case 29: return "BuildStory";
-    case 32: return "GeneratePsoCache";
-    case 33: return "LoadPsoCache";
-    case 34: return "AnalyticsSessionEnd";
-    default: return "ERROR";
-    }
-}
 
 namespace SmartDiceRolls {
 
@@ -227,137 +197,128 @@ namespace SmartDiceRolls {
         return true;
     }
 
-
-static bool IsValidClientState(uint32_t s)
-{
-    switch (s) {
-    case 0:  case 1:  case 2:  case 3:  case 4:
-    case 5:  case 6:  case 7:  case 8:  case 9:
-    case 10: case 11: case 12: case 13: case 14:
-    case 15: case 16: case 17: case 18: case 19:
-    case 20: case 21: case 22: case 23: case 24:
-    case 25: case 26: case 27: case 28: case 29:
-    case 32: case 33: case 34:
-        return true;
-    default:
-        return false;
-    }
-}
-
-void Reroll_Hook(long long a1)
-{
+    void Reroll_Hook(long long a1)
     {
-        std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
-        g_dialogueRoll.rerollPending = true;
-        g_dialogueRoll.active = true;
-        g_dialogueRoll.waitingForResolution = true;
-        g_dialogueRoll.lastPromptState = 0;
-        g_dialogueRoll.generation++;
+        {
+            std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
+            // populate dialogue roll session data
+            g_dialogueRoll.rerollPending = true;
+            g_dialogueRoll.active = true;
+            g_dialogueRoll.waitingForResolution = true;
+            g_dialogueRoll.generation++;
+
+            // populate smart dice context for the tray app
+            g_smartDiceResult.ready = false;
+            g_smartDiceResult.generation = g_dialogueRoll.generation;
+            g_smartDiceResult.die1 = 0;
+            g_smartDiceResult.die2 = 0;
+
+            // TODO: notify tray app that the player should roll
+        }
+
+        // clear previous pending physical dice here and notify tray app
+        // for new roll
+
+        _LOG("Reroll hook");
+        _LOG("Notify tray app for rolling!");
+        Reroll_Original(a1);
     }
 
-    // clear previous pending physical dice here and notify tray app
-    // for new roll
+    // TODO: move this to helpers
+    static RollMode GetModeFromRollState(const uint8_t* p)
+    {
+        if (!p) return RollMode::Unknown;
 
-    _LOG("Reroll hook");
-    _LOG("Notify tray app for rolling!");
-    Reroll_Original(a1);
-}
+        uint8_t advType = *(p + 0x40);
 
-// TODO: move this to helpers
-static RollMode GetModeFromRollState(const uint8_t* p)
-{
-    if (!p) return RollMode::Unknown;
-
-    uint8_t advType = *(p + 0x40);
-
-    switch (advType) {
-    case 1:
-        return RollMode::Advantage;
-    case 2:
-        return RollMode::Disadvantage;
-    default:
-        return RollMode::Normal;
+        switch (advType) {
+        case 1:
+            return RollMode::Advantage;
+        case 2:
+            return RollMode::Disadvantage;
+        default:
+            return RollMode::Normal;
+        }
     }
-}
 
 #if 0
-void ResolveDialogueRoll_Hook (
-    int64_t rollContext, int64_t* ecsOrClientCtx,
-    int64_t rollState, char isReplayOrUiFlag) {
+    void ResolveDialogueRoll_Hook (
+        int64_t rollContext, int64_t* ecsOrClientCtx,
+        int64_t rollState, char isReplayOrUiFlag) {
 
-    _LOG("ResolveDialogueRoll Hook!");
+        _LOG("ResolveDialogueRoll Hook!");
 
-    // observed / likely
-    // +0x40  adv/disadv selector enum
-    // +0x41  difficultyClass
-    // +0x42  finalKeptDieCompact
-    // +0x43  finalOtherDieCompact
-    // +0x44  finalModifierCompact
-    // +0x4C  finalSuccess
-    // +0x54  roll mode/type
-    // +0x88  uiReplayFlag
-    // +0xAC  modifier
-    // +0xB5  advFlagResolved
-    // +0xB6  disFlagResolved
-    // +0xC8  finalTotal
-    // +0xCC  keptNaturalRoll
-    // +0xD0  otherNaturalRoll
+        // observed / likely
+        // +0x40  adv/disadv selector enum
+        // +0x41  difficultyClass
+        // +0x42  finalKeptDieCompact
+        // +0x43  finalOtherDieCompact
+        // +0x44  finalModifierCompact
+        // +0x4C  finalSuccess
+        // +0x54  roll mode/type
+        // +0x88  uiReplayFlag
+        // +0xAC  modifier
+        // +0xB5  advFlagResolved
+        // +0xB6  disFlagResolved
+        // +0xC8  finalTotal
+        // +0xCC  keptNaturalRoll
+        // +0xD0  otherNaturalRoll
 
-    ResolveDialogueRoll_Original (
-        rollContext, ecsOrClientCtx,
-        rollState, isReplayOrUiFlag
-    );
+        ResolveDialogueRoll_Original (
+            rollContext, ecsOrClientCtx,
+            rollState, isReplayOrUiFlag
+        );
 
-    // quick and dirty static patching
-    auto p = reinterpret_cast<uint8_t*>(rollState);
+        // quick and dirty static patching
+        auto p = reinterpret_cast<uint8_t*>(rollState);
 
-    int dc       = *(uint8_t*)(p + 0x41);
-    int modifier = *reinterpret_cast<int*>(p + 0xAC);
+        int dc       = *(uint8_t*)(p + 0x41);
+        int modifier = *reinterpret_cast<int*>(p + 0xAC);
 
-    int keptDie  = 1;
-    int otherDie = 4;
-    int total    = keptDie + modifier;
-    bool success = total >= dc;
+        int keptDie  = 1;
+        int otherDie = 4;
+        int total    = keptDie + modifier;
+        bool success = total >= dc;
 
-    uint8_t rawMode = *(p + 0x40);
-    RollMode mode = GetModeFromRollState(p);
+        uint8_t rawMode = *(p + 0x40);
+        RollMode mode = GetModeFromRollState(p);
 
-    *reinterpret_cast<int*>(p + 0xCC) = keptDie;
-    *reinterpret_cast<int*>(p + 0xD0) = otherDie;
-    *reinterpret_cast<int*>(p + 0xC8) = total;
+        *reinterpret_cast<int*>(p + 0xCC) = keptDie;
+        *reinterpret_cast<int*>(p + 0xD0) = otherDie;
+        *reinterpret_cast<int*>(p + 0xC8) = total;
 
-    *(p + 0x42) = static_cast<uint8_t>(keptDie);
-    *(p + 0x43) = static_cast<uint8_t>(otherDie);
-    *(p + 0x44) = static_cast<uint8_t>(modifier);
-    *(p + 0x4C) = success ? 1 : 0;
+        *(p + 0x42) = static_cast<uint8_t>(keptDie);
+        *(p + 0x43) = static_cast<uint8_t>(otherDie);
+        *(p + 0x44) = static_cast<uint8_t>(modifier);
+        *(p + 0x4C) = success ? 1 : 0;
 
-    _LOG (
-        "[Dialogue Roll] rawMode: %u, mode:%s, dc: %d, modifier: %d, kept die: %d, other die: %d, "
-        "total: %d, result: %s",
-        static_cast<unsigned>(rawMode),
-        RollModeName(mode),
-        dc, modifier, keptDie, otherDie, total, success ? "success" : "failure"
-    );
-}
+        _LOG (
+            "[Dialogue Roll] rawMode: %u, mode:%s, dc: %d, modifier: %d, kept die: %d, other die: %d, "
+            "total: %d, result: %s",
+            static_cast<unsigned>(rawMode),
+            RollModeName(mode),
+            dc, modifier, keptDie, otherDie, total, success ? "success" : "failure"
+        );
+    }
 #endif
 
 
-static RollMode GetModeFromRawMode(uint8_t rawMode)
-{
-    switch (rawMode) {
-    case 0: return RollMode::Normal;
-    case 1: return RollMode::Advantage;
-    case 2: return RollMode::Disadvantage;
-    default: return RollMode::Unknown;
+    static RollMode GetModeFromRawMode(uint8_t rawMode)
+    {
+        switch (rawMode) {
+        case 0: return RollMode::Normal;
+        case 1: return RollMode::Advantage;
+        case 2: return RollMode::Disadvantage;
+        default: return RollMode::Unknown;
+        }
     }
-}
 
-void __fastcall ResolveDialogueRoll_Hook(
-    int64_t rollContext,
-    int64_t* ecsOrClientCtx,
-    int64_t rollStatePtr,
-    char isReplayOrUiFlag)
-{
+    void __fastcall ResolveDialogueRoll_Hook(
+        int64_t rollContext,
+        int64_t* ecsOrClientCtx,
+        int64_t rollStatePtr,
+        char isReplayOrUiFlag)
+    {
 
 
     ResolveDialogueRoll_Original(
@@ -386,6 +347,7 @@ void __fastcall ResolveDialogueRoll_Hook(
 
     if (isDialoguePrompt) {
         std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
+        // populate dialogue roll session data
         g_dialogueRoll.active = true;
         g_dialogueRoll.waitingForResolution = true;
         g_dialogueRoll.rerollPending = false;
@@ -393,10 +355,29 @@ void __fastcall ResolveDialogueRoll_Hook(
         g_dialogueRoll.mode = GetModeFromRawMode(rollState->rawMode);
         g_dialogueRoll.dc = rollState->difficultyClass;
         g_dialogueRoll.modifier = rollState->modifier;
-        g_dialogueRoll.lastPromptState = rollStatePtr;
 
-        // notify tray app here
+        // populate smart dice context for the tray app
+        g_smartDiceResult.ready = false; // waiting for tray app
+        g_smartDiceResult.generation = g_dialogueRoll.generation;
+        g_smartDiceResult.die1 = 0;
+        g_smartDiceResult.die2 = 0;
+
+        // TODO: notify tray app here
         _LOG("Notify tray app for rolling!");
+
+        // when the tray app replies, a thread should receive the response
+        // and only fill g_smartDiceResult; those data will be patched in the
+        // next ResolveDialogueRoll_Hook
+
+        // we should do something like this:
+        /*{
+            std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
+
+            g_smartDiceResult.ready = true;
+            g_smartDiceResult.generation = incomingGeneration;
+            g_smartDiceResult.die1 = incomingDie1;
+            g_smartDiceResult.die2 = incomingDie2;
+        }*/
     }
 
     if (!isDialogueFollowup && !isDialoguePrompt) {
@@ -422,9 +403,71 @@ void __fastcall ResolveDialogueRoll_Hook(
         (unsigned)rollState->difficultyClass,
         (int)rollState->modifier);
 
+    SmartDiceResult dice{};
+    DialogueRollSession session{};
+
     // patch only if you have pending physical dice for the current dialogue session
     {
         std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
+
+        // if it is a real dialogue followup and the smart dice result is ready
+        // for the same generation, patch rollState
+        session = g_dialogueRoll;
+        dice = g_smartDiceResult;
+
+        if (!session.active || !session.waitingForResolution)
+            return;
+
+        if (!dice.ready || dice.generation != session.generation)
+            return;
+
+        // TODO: we can make this a separate function
+        uint32_t d1 = ClampD20(dice.die1);
+        uint32_t d2 = ClampD20(dice.die2);
+
+        uint32_t keptDie = d1;
+        uint32_t otherDie = d2;
+
+        switch (session.mode) {
+        case RollMode::Advantage:
+            keptDie = (d1 >= d2) ? d1 : d2;
+            otherDie = (d1 >= d2) ? d2 : d1;
+            break;
+
+        case RollMode::Disadvantage:
+            keptDie = (d1 <= d2) ? d1 : d2;
+            otherDie = (d1 <= d2) ? d2 : d1;
+            break;
+
+        case RollMode::Normal:
+        default:
+            keptDie = d1;
+            otherDie = d2;
+            break;
+        }
+
+        // TODO: make the patch a separate function
+        int total = static_cast<int>(keptDie) + session.modifier;
+        bool success = total >= static_cast<int>(session.dc);
+
+        rollState->keptNaturalRoll = keptDie;
+        rollState->otherNaturalRoll = otherDie;
+        rollState->finalTotal = total;
+
+        rollState->finalKeptDie = static_cast<uint8_t>(keptDie);
+        rollState->finalOtherDie = static_cast<uint8_t>(otherDie);
+        rollState->finalModifier = static_cast<uint8_t>(session.modifier);
+        rollState->finalSuccess = success ? 1 : 0;
+
+
+    _LOG("[Patched roll] ctx=%p state=%p uiFlag=%d rawMode=%u dc=%u mod=%d",
+        (void*)rollContext,
+        (void*)rollStatePtr,
+        (int)isReplayOrUiFlag,
+        (unsigned)rollState->rawMode,
+        (unsigned)rollState->difficultyClass,
+        (int)rollState->modifier);
+
         ResetDialogueRollSession();
     }
 
