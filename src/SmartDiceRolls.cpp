@@ -13,10 +13,15 @@
 
 // for getting the caller
 #include <intrin.h>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
-#include <windows.h>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <windows.h>
+#include <shellapi.h>
 
 #define INI_LOCATION "./mods/smart-dice-rolls-mod.ini"
 
@@ -197,6 +202,9 @@ namespace SmartDiceRolls {
         return true;
     }
 
+    // Forward declaration — defined further below with the pipe client code
+    static void notifyTrayForRoll(const char* mode, uint32_t generation);
+
     void Reroll_Hook(long long a1)
     {
         {
@@ -213,14 +221,11 @@ namespace SmartDiceRolls {
             g_smartDiceResult.die1 = 0;
             g_smartDiceResult.die2 = 0;
 
-            // TODO: notify tray app that the player should roll
+            // Notify tray app — reuse the mode from the current session
+            notifyTrayForRoll(RollModeName(g_dialogueRoll.mode), g_dialogueRoll.generation);
         }
 
-        // clear previous pending physical dice here and notify tray app
-        // for new roll
-
         _LOG("Reroll hook");
-        _LOG("Notify tray app for rolling!");
         Reroll_Original(a1);
     }
 
@@ -313,6 +318,315 @@ namespace SmartDiceRolls {
         }
     }
 
+
+    // ── Pipe client for PixelsTray RollServer ──────────────────────────
+
+    static constexpr const wchar_t* kPipeName = L"\\\\.\\pipe\\PixelsDiceRoll";
+    static constexpr int kMaxConnectAttempts = 5;
+    static constexpr int kConnectRetryMs = 2000;
+    static constexpr const char* kTrayTaskName = "PixelsTray Service";
+    static constexpr const wchar_t* kTrayExePath = L"./mods/PixelsTray/PixelsTray.exe";
+
+    static HANDLE g_pipe = INVALID_HANDLE_VALUE;
+    static std::mutex g_pipeMutex;
+    static std::thread g_pipeListenerThread;
+    static std::atomic<bool> g_pipeRunning{false};
+
+    // Minimal JSON helpers for the flat protocol
+    static std::string jsonStringValue(const std::string& json, const std::string& key)
+    {
+        std::string needle = "\"" + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return "";
+        pos = json.find(':', pos + needle.size());
+        if (pos == std::string::npos) return "";
+        pos = json.find('"', pos + 1);
+        if (pos == std::string::npos) return "";
+        auto end = json.find('"', pos + 1);
+        if (end == std::string::npos) return "";
+        return json.substr(pos + 1, end - pos - 1);
+    }
+
+    static int jsonIntValue(const std::string& json, const std::string& key, int def = 0)
+    {
+        std::string needle = "\"" + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return def;
+        pos = json.find(':', pos + needle.size());
+        if (pos == std::string::npos) return def;
+        pos++;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+        try { return std::stoi(json.substr(pos)); }
+        catch (...) { return def; }
+    }
+
+    // Try to launch the tray app via scheduled task or direct elevation
+    static bool scheduledTaskExists(const char* taskName)
+    {
+        std::string query = "schtasks /query /TN \"" + std::string(taskName) + "\" >nul 2>&1";
+        int result = WinExec(query.c_str(), SW_HIDE);
+        return (result > 31);
+    }
+
+    static bool launchTrayElevated()
+    {
+        wchar_t fullPath[MAX_PATH];
+        if (!GetFullPathNameW(kTrayExePath, MAX_PATH, fullPath, nullptr))
+        {
+            _LOG("[PipeClient] Failed to resolve tray exe path");
+            return false;
+        }
+
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpVerb = L"runas";
+        sei.lpFile = fullPath;
+        sei.nShow = SW_HIDE;
+        sei.fMask = SEE_MASK_NO_CONSOLE;
+
+        if (!ShellExecuteExW(&sei))
+        {
+            _LOG("[PipeClient] ShellExecuteEx failed: %lu", GetLastError());
+            return false;
+        }
+        return true;
+    }
+
+    static bool launchTrayTaskOrElevated()
+    {
+        if (scheduledTaskExists(kTrayTaskName))
+        {
+            std::string cmd = "schtasks /run /TN \"" + std::string(kTrayTaskName) + "\" /I";
+            _LOG("[PipeClient] Running task: %s", cmd.c_str());
+            int result = WinExec(cmd.c_str(), SW_HIDE);
+            if (result > 31)
+            {
+                _LOG("[PipeClient] Tray task launched successfully");
+                return true;
+            }
+            _LOG("[PipeClient] Task run failed (code %d), falling back to elevation", result);
+        }
+        else
+        {
+            _LOG("[PipeClient] Scheduled task not found, falling back to elevation");
+        }
+
+        return launchTrayElevated();
+    }
+
+    // Connect to the named pipe, optionally launching the tray app first
+    static bool connectPipe()
+    {
+        for (int attempt = 0; attempt < kMaxConnectAttempts; attempt++)
+        {
+            HANDLE pipe = CreateFileW(
+                kPipeName,
+                GENERIC_READ | GENERIC_WRITE,
+                0, nullptr, OPEN_EXISTING, 0, nullptr);
+
+            if (pipe != INVALID_HANDLE_VALUE)
+            {
+                std::lock_guard<std::mutex> lock(g_pipeMutex);
+                g_pipe = pipe;
+                _LOG("[PipeClient] Connected to tray app (attempt %d)", attempt + 1);
+                return true;
+            }
+
+            DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND && attempt == 0)
+            {
+                _LOG("[PipeClient] Pipe not found, attempting to launch tray app...");
+                launchTrayTaskOrElevated();
+            }
+            else if (err == ERROR_PIPE_BUSY)
+            {
+                _LOG("[PipeClient] Pipe busy, waiting...");
+                WaitNamedPipeW(kPipeName, 5000);
+                continue;
+            }
+
+            _LOG("[PipeClient] Connect attempt %d failed (error %lu), retrying in %dms...",
+                attempt + 1, err, kConnectRetryMs);
+            Sleep(kConnectRetryMs);
+        }
+
+        _LOG("[PipeClient] Failed to connect after %d attempts", kMaxConnectAttempts);
+        return false;
+    }
+
+    static void disconnectPipe()
+    {
+        std::lock_guard<std::mutex> lock(g_pipeMutex);
+        if (g_pipe != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(g_pipe);
+            g_pipe = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    // Send a JSON request and read the JSON response (newline-delimited)
+    static bool sendAndReceive(const std::string& request, std::string& response)
+    {
+        std::lock_guard<std::mutex> lock(g_pipeMutex);
+        if (g_pipe == INVALID_HANDLE_VALUE) return false;
+
+        std::string msg = request + "\n";
+        DWORD written = 0;
+        if (!WriteFile(g_pipe, msg.c_str(), static_cast<DWORD>(msg.size()), &written, nullptr))
+        {
+            _LOG("[PipeClient] WriteFile failed: %lu", GetLastError());
+            return false;
+        }
+        FlushFileBuffers(g_pipe);
+
+        response.clear();
+        char buf[4096];
+        while (true)
+        {
+            DWORD bytesRead = 0;
+            if (!ReadFile(g_pipe, buf, sizeof(buf) - 1, &bytesRead, nullptr) || bytesRead == 0)
+            {
+                _LOG("[PipeClient] ReadFile failed: %lu", GetLastError());
+                return false;
+            }
+            buf[bytesRead] = '\0';
+            response += buf;
+            if (response.find('\n') != std::string::npos) break;
+        }
+
+        // Trim
+        while (!response.empty() && (response.back() == '\n' || response.back() == '\r'))
+            response.pop_back();
+
+        return true;
+    }
+
+    // Send a roll request to the tray app and block until the result arrives
+    static bool requestRoll(const char* mode, uint32_t generation, SmartDiceResult& outResult)
+    {
+        char json[256];
+        snprintf(json, sizeof(json),
+            "{\"mode\": \"%s\", \"generation\": %u}", mode, generation);
+
+        _LOG("[PipeClient] Sending: %s", json);
+
+        std::string response;
+        if (!sendAndReceive(json, response))
+        {
+            _LOG("[PipeClient] Request failed");
+            return false;
+        }
+
+        _LOG("[PipeClient] Response: %s", response.c_str());
+
+        outResult.die1 = static_cast<uint32_t>(jsonIntValue(response, "die1"));
+        outResult.die2 = static_cast<uint32_t>(jsonIntValue(response, "die2"));
+        outResult.generation = static_cast<uint32_t>(jsonIntValue(response, "generation"));
+        outResult.ready = true;
+        return true;
+    }
+
+    // Send the "ready" command so the tray app clicks the BG3 dice icon
+    static void sendReady()
+    {
+        std::string response;
+        sendAndReceive("{\"mode\": \"ready\"}", response);
+        _LOG("[PipeClient] Ready response: %s", response.c_str());
+    }
+
+    // Background thread that waits for roll requests from the hooks,
+    // communicates with the tray app, and fills g_smartDiceResult.
+    static std::condition_variable g_rollRequestCv;
+    static std::mutex g_rollRequestMutex;
+    static bool g_rollRequestPending = false;
+    static std::string g_rollRequestMode;
+    static uint32_t g_rollRequestGeneration = 0;
+
+    static void notifyTrayForRoll(const char* mode, uint32_t generation)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_rollRequestMutex);
+            g_rollRequestMode = mode;
+            g_rollRequestGeneration = generation;
+            g_rollRequestPending = true;
+        }
+        g_rollRequestCv.notify_one();
+    }
+
+    static void pipeListenerThread()
+    {
+        _LOG("[PipeClient] Listener thread started");
+
+        if (!connectPipe())
+        {
+            _LOG("[PipeClient] Listener thread exiting — no connection");
+            return;
+        }
+
+        while (g_pipeRunning)
+        {
+            std::string mode;
+            uint32_t generation = 0;
+
+            // Wait for a roll request from the hooks
+            {
+                std::unique_lock<std::mutex> lock(g_rollRequestMutex);
+                g_rollRequestCv.wait(lock, []()
+                {
+                    return g_rollRequestPending || !g_pipeRunning;
+                });
+                if (!g_pipeRunning) break;
+
+                mode = g_rollRequestMode;
+                generation = g_rollRequestGeneration;
+                g_rollRequestPending = false;
+            }
+
+            // Send the roll request to the tray app and wait for the result
+            SmartDiceResult result{};
+            if (requestRoll(mode.c_str(), generation, result))
+            {
+                // Fill g_smartDiceResult so the next followup call can patch
+                {
+                    std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
+                    g_smartDiceResult = result;
+                }
+                _LOG("[PipeClient] Roll result ready: gen=%u die1=%u die2=%u",
+                    result.generation, result.die1, result.die2);
+
+                // Send "ready" so the tray app clicks the BG3 dice icon
+                sendReady();
+            }
+            else
+            {
+                _LOG("[PipeClient] Roll request failed, attempting reconnect...");
+                disconnectPipe();
+                if (!connectPipe())
+                {
+                    _LOG("[PipeClient] Reconnect failed, listener stopping");
+                    break;
+                }
+            }
+        }
+
+        disconnectPipe();
+        _LOG("[PipeClient] Listener thread stopped");
+    }
+
+    static void startPipeClient()
+    {
+        g_pipeRunning = true;
+        g_pipeListenerThread = std::thread(pipeListenerThread);
+    }
+
+    static void stopPipeClient()
+    {
+        g_pipeRunning = false;
+        g_rollRequestCv.notify_all();
+        if (g_pipeListenerThread.joinable())
+            g_pipeListenerThread.join();
+        disconnectPipe();
+    }
+
     void __fastcall ResolveDialogueRoll_Hook(
         int64_t rollContext,
         int64_t* ecsOrClientCtx,
@@ -362,23 +676,12 @@ namespace SmartDiceRolls {
         g_smartDiceResult.die1 = 0;
         g_smartDiceResult.die2 = 0;
 
-        // TODO: notify tray app here
-        _LOG("Notify tray app for rolling!");
-
-        // when the tray app replies, a thread should receive the response
-        // and only fill g_smartDiceResult; those data will be patched in the
-        // next ResolveDialogueRoll_Hook
-
-        // we should do something like this:
-        /*{
-            std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
-
-            g_smartDiceResult.ready = true;
-            g_smartDiceResult.generation = incomingGeneration;
-            g_smartDiceResult.die1 = incomingDie1;
-            g_smartDiceResult.die2 = incomingDie2;
-        }*/
+        // Notify tray app to start collecting rolls
+        notifyTrayForRoll(RollModeName(g_dialogueRoll.mode), g_dialogueRoll.generation);
+        _LOG("Notify tray app for rolling! mode=%s gen=%u",
+            RollModeName(g_dialogueRoll.mode), g_dialogueRoll.generation);
     }
+    _LOG("* isDialoguePrompt: %d, isDialogueFollowup: %d", isDialoguePrompt, isDialogueFollowup);
 
     if (!isDialogueFollowup && !isDialoguePrompt) {
 
@@ -405,6 +708,14 @@ namespace SmartDiceRolls {
 
     SmartDiceResult dice{};
     DialogueRollSession session{};
+
+
+    // perhaps this should be done during patching?
+    //if (isDialogueFollowup) {
+    //    ResetDialogueRollSession();
+    //}
+
+    // This is a dialogue follow up
 
     // patch only if you have pending physical dice for the current dialogue session
     {
@@ -597,6 +908,9 @@ _LOG("[ResolveRoll] ctx=%p state=%p uiFlag=%d rawMode=%u dc=%u mod=%d",
             _LOG("FATAL: Incompatible version");
             return;
         }
+
+        // Start the pipe client thread to communicate with PixelsTray
+        startPipeClient();
 
         _LOG("Ready.");
     }
