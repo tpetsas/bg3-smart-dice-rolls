@@ -13,6 +13,7 @@ add_library(smart-dice-rolls SHARED
     src/Utils.cpp
     src/Config.cpp
     src/SmartDiceRolls.cpp
+    src/PixelsDiceClient.cpp
     src/minhook/src/buffer.c
     src/minhook/src/hook.c
     src/minhook/src/trampoline.c
