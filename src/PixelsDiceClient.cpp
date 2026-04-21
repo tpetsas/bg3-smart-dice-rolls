@@ -12,8 +12,10 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include <windows.h>
 #include <shellapi.h>
+#include "minhook/include/MinHook.h"
 
 // shared state (defined in SmartDiceRolls.cpp)
 extern std::mutex g_dialogueRollMutex;
@@ -246,6 +248,370 @@ static void sendReady()
     _LOG("[PipeClient] Ready response: %s", response.c_str());
 }
 
+// ── GetRawInputData hook — triangle injection for DualSense controller ──
+//
+// DualSense USB HID report (64 bytes, report ID 0x01):
+//   Byte 0: Report ID (0x01)
+//   Byte 1: Left stick X
+//   Byte 2: Left stick Y
+//   Byte 3: Right stick X
+//   Byte 4: Right stick Y
+//   Byte 5: D-pad (bits 0-3) | Square(4) | Cross(5) | Circle(6) | Triangle(7)
+//
+// Triangle = byte 5, bit 7 = 0x80
+
+using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT hRawInput, UINT uiCommand,
+    LPVOID pData, PUINT pcbSize, UINT cbSizeHeader);
+static GetRawInputData_t GetRawInputData_Original = nullptr;
+
+static std::atomic<bool> g_hasHidController{false};  // true once we see DualSense input
+static std::atomic<int>  g_injectFrames{0};           // >0 = inject triangle for N more reports
+static HANDLE g_dualsenseDevice = nullptr;             // cached device handle for DualSense
+
+static constexpr int kTrianglePressReports  = 3;   // ~12ms at 250Hz — quick tap, avoids fast-forward
+static constexpr int kTriangleButtonByte    = 8;   // offset in HID report (byte 8 = dpad + face buttons)
+static constexpr BYTE kTriangleButtonMask   = 0x80; // bit 7 = Triangle
+
+// Check if a raw input device is a DualSense controller
+static bool isDualSenseDevice(HANDLE hDevice)
+{
+    // Get device name (path contains VID/PID)
+    UINT nameSize = 0;
+    if (GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, nullptr, &nameSize) != 0)
+        return false;
+
+    std::wstring deviceName(nameSize, L'\0');
+    if (GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, &deviceName[0], &nameSize) == (UINT)-1)
+        return false;
+
+    // Convert to lowercase for matching
+    for (auto& ch : deviceName) ch = towlower(ch);
+
+    // DualSense VID=054C PID=0CE6, DualSense Edge VID=054C PID=0DF2
+    bool isDualSense = (deviceName.find(L"vid_054c") != std::wstring::npos) &&
+                       (deviceName.find(L"pid_0ce6") != std::wstring::npos ||
+                        deviceName.find(L"pid_0df2") != std::wstring::npos);
+
+    // Log device info for diagnostics
+    char narrowName[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, deviceName.c_str(), -1, narrowName, sizeof(narrowName), nullptr, nullptr);
+    _LOG("[RawInput] HID device: %s → %s", narrowName, isDualSense ? "DUALSENSE" : "other");
+
+    return isDualSense;
+}
+
+static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
+    LPVOID pData, PUINT pcbSize, UINT cbSizeHeader)
+{
+    UINT result = GetRawInputData_Original(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
+
+    if (pData && uiCommand == RID_INPUT && result != (UINT)-1)
+    {
+        RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(pData);
+
+        if (raw->header.dwType == RIM_TYPEHID &&
+            raw->data.hid.dwSizeHid > static_cast<DWORD>(kTriangleButtonByte) &&
+            raw->data.hid.dwCount > 0)
+        {
+            // Identify the DualSense device on first HID report
+            if (!g_hasHidController.load(std::memory_order_relaxed))
+            {
+                if (isDualSenseDevice(raw->header.hDevice))
+                {
+                    g_dualsenseDevice = raw->header.hDevice;
+                    g_hasHidController.store(true, std::memory_order_relaxed);
+                    _LOG("[RawInput] DualSense detected — triangle injection available (handle=%p)",
+                        raw->header.hDevice);
+
+                    // Dump first report for verification
+                    BYTE* reportData = raw->data.hid.bRawData;
+                    char hex[256] = {};
+                    int pos = 0;
+                    UINT sz = raw->data.hid.dwSizeHid;
+                    for (UINT i = 0; i < sz && i < 20 && pos < 250; i++)
+                        pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", reportData[i]);
+                    _LOG("[RawInput] Report (size=%u): %s", sz, hex);
+                }
+            }
+
+            // NOTE: injection via GetRawInputData doesn't affect SDL's input.
+            // SDL reads DualSense via hidapi (ReadFile). Injection is done
+            // in ReadFile_Hook / GetOverlappedResult_Hook instead.
+        }
+    }
+
+    return result;
+}
+
+static std::atomic<int> g_readFile64Count{0};  // count 64-byte reads for diagnostics
+
+static void requestTrianglePress()
+{
+    g_injectFrames.store(kTrianglePressReports, std::memory_order_relaxed);
+    _LOG("[RawInput] Triangle press requested (%d reports), 64-byte reads so far: %d",
+        kTrianglePressReports, g_readFile64Count.load(std::memory_order_relaxed));
+}
+
+// ── HID file hooks — intercept SDL's hidapi reads from the DualSense ──
+//
+// SDL reads the DualSense via hidapi which uses ReadFile with overlapped I/O.
+// We hook CreateFileW to identify the DualSense handle, then ReadFile +
+// GetOverlappedResult to modify completed reads.
+
+using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using ReadFile_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using GetOverlappedResult_t = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
+
+static CreateFileA_t CreateFileA_Original = nullptr;
+static CreateFileW_t CreateFileW_Original = nullptr;
+static ReadFile_t ReadFile_Original = nullptr;
+static GetOverlappedResult_t GetOverlappedResult_Original = nullptr;
+
+// SDL opens the DualSense multiple times — track all handles
+static std::mutex g_dsHandlesMutex;
+static std::vector<HANDLE> g_dualsenseHandles;
+
+static bool isDualsenseHandle(HANDLE h)
+{
+    std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
+    for (auto& dh : g_dualsenseHandles)
+        if (dh == h) return true;
+    return false;
+}
+
+// Track ONE pending overlapped DualSense read (SDL only has one at a time)
+static std::atomic<LPOVERLAPPED> g_pendingOl{nullptr};
+static std::atomic<LPVOID>       g_pendingBuf{nullptr};
+
+static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
+    DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
+{
+    HANDLE result = CreateFileW_Original(lpFileName, dwDesiredAccess, dwShareMode,
+        lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+
+    if (result != INVALID_HANDLE_VALUE && lpFileName)
+    {
+        std::wstring path(lpFileName);
+        for (auto& ch : path) ch = towlower(ch);
+
+        if (path.find(L"vid_054c") != std::wstring::npos &&
+            (path.find(L"pid_0ce6") != std::wstring::npos ||
+             path.find(L"pid_0df2") != std::wstring::npos))
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
+                g_dualsenseHandles.push_back(result);
+            }
+            g_hasHidController.store(true, std::memory_order_relaxed);
+
+            char narrow[512] = {};
+            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, narrow, sizeof(narrow), nullptr, nullptr);
+            _LOG("[HID] DualSense file opened: handle=%p path=%s", result, narrow);
+        }
+    }
+
+    return result;
+}
+
+static HANDLE WINAPI CreateFileA_Hook(LPCSTR lpFileName, DWORD dwDesiredAccess,
+    DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
+{
+    HANDLE result = CreateFileA_Original(lpFileName, dwDesiredAccess, dwShareMode,
+        lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+
+    if (result != INVALID_HANDLE_VALUE && lpFileName)
+    {
+        std::string path(lpFileName);
+        for (auto& ch : path) ch = tolower(ch);
+
+        if (path.find("vid_054c") != std::string::npos &&
+            (path.find("pid_0ce6") != std::string::npos ||
+             path.find("pid_0df2") != std::string::npos))
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
+                g_dualsenseHandles.push_back(result);
+            }
+            g_hasHidController.store(true, std::memory_order_relaxed);
+            _LOG("[HID] DualSense file opened (A): handle=%p path=%s", result, lpFileName);
+        }
+    }
+
+    return result;
+}
+
+static std::atomic<bool> g_readFileLoggedOnce{false};
+
+static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
+    LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
+{
+    BOOL result = ReadFile_Original(hFile, lpBuffer, nNumberOfBytesToRead,
+        lpNumberOfBytesRead, lpOverlapped);
+
+    // Fast path: only care about 64-byte reads (DualSense USB HID report size)
+    if (nNumberOfBytesToRead != 64 || !lpBuffer)
+        return result;
+
+    g_readFile64Count.fetch_add(1, std::memory_order_relaxed);
+
+    if (result)
+    {
+        // Synchronous completion — check if it looks like a DualSense report
+        BYTE* buf = static_cast<BYTE*>(lpBuffer);
+        if (buf[0] == 0x01)  // DualSense USB report ID
+        {
+            if (!g_readFileLoggedOnce.exchange(true, std::memory_order_relaxed))
+            {
+                g_hasHidController.store(true, std::memory_order_relaxed);
+                char hex[64] = {};
+                int pos = 0;
+                for (int i = 0; i < 10 && pos < 60; i++)
+                    pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
+                _LOG("[HID] DualSense 64-byte read (sync): handle=%p data=%s", hFile, hex);
+            }
+            // NOTE: do NOT inject here — sync reads are consumed by Steam,
+            // not SDL. Injection happens in GetOverlappedResult_Hook only.
+        }
+    }
+    else if (lpOverlapped && GetLastError() == ERROR_IO_PENDING)
+    {
+        // Async — save for GetOverlappedResult (any 64-byte overlapped read)
+        DWORD savedErr = GetLastError();
+        g_pendingBuf.store(lpBuffer, std::memory_order_relaxed);
+        g_pendingOl.store(lpOverlapped, std::memory_order_relaxed);
+        SetLastError(savedErr);
+
+        if (!g_readFileLoggedOnce.exchange(true, std::memory_order_relaxed))
+            _LOG("[HID] 64-byte overlapped read pending: handle=%p", hFile);
+    }
+
+    return result;
+}
+
+static std::atomic<bool> g_gorLoggedOnce{false};
+
+static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlapped,
+    LPDWORD lpNumberOfBytesTransferred, BOOL bWait)
+{
+    BOOL result = GetOverlappedResult_Original(hFile, lpOverlapped,
+        lpNumberOfBytesTransferred, bWait);
+
+    if (result && lpOverlapped == g_pendingOl.load(std::memory_order_relaxed))
+    {
+        LPVOID buffer = g_pendingBuf.load(std::memory_order_relaxed);
+        g_pendingOl.store(nullptr, std::memory_order_relaxed);
+
+        if (buffer)
+        {
+            BYTE* buf = static_cast<BYTE*>(buffer);
+
+            // Diagnostic: log once when async DualSense read completes
+            if (buf[0] == 0x01 && !g_gorLoggedOnce.load(std::memory_order_relaxed))
+            {
+                g_gorLoggedOnce.store(true, std::memory_order_relaxed);
+                DWORD bytes = lpNumberOfBytesTransferred ? *lpNumberOfBytesTransferred : 0;
+                char hex[64] = {};
+                int pos = 0;
+                for (int i = 0; i < 10 && pos < 60; i++)
+                    pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
+                _LOG("[HID] Async DualSense read completed: handle=%p bytes=%u data=%s",
+                    hFile, bytes, hex);
+                g_hasHidController.store(true, std::memory_order_relaxed);
+            }
+
+            int remaining = g_injectFrames.load(std::memory_order_relaxed);
+            if (remaining > 0 && buf[0] == 0x01)
+            {
+                buf[kTriangleButtonByte] |= kTriangleButtonMask;
+                g_injectFrames.fetch_sub(1, std::memory_order_relaxed);
+
+                if (remaining == kTrianglePressReports)
+                    _LOG("[HID] Triangle injection STARTED (async, byte[%d]: 0x%02X)",
+                        kTriangleButtonByte, buf[kTriangleButtonByte]);
+                if (remaining == 1)
+                    _LOG("[HID] Triangle injection ENDED");
+            }
+        }
+    }
+
+    return result;
+}
+
+static void hookAllInput()
+{
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+
+    // 1. GetRawInputData (covers raw input path)
+    auto fnRaw = GetProcAddress(user32, "GetRawInputData");
+    if (fnRaw) {
+        if (MH_CreateHook(fnRaw, GetRawInputData_Hook,
+                reinterpret_cast<LPVOID*>(&GetRawInputData_Original)) == MH_OK &&
+            MH_EnableHook(fnRaw) == MH_OK)
+            _LOG("[Hook] GetRawInputData hooked");
+        else
+            _LOG("[Hook] GetRawInputData hook FAILED");
+    }
+
+    // 2a. CreateFileA (SDL hidapi uses this to open HID devices)
+    auto fnCreateA = GetProcAddress(kernel32, "CreateFileA");
+    if (fnCreateA) {
+        if (MH_CreateHook(fnCreateA, CreateFileA_Hook,
+                reinterpret_cast<LPVOID*>(&CreateFileA_Original)) == MH_OK &&
+            MH_EnableHook(fnCreateA) == MH_OK)
+            _LOG("[Hook] CreateFileA hooked");
+        else
+            _LOG("[Hook] CreateFileA hook FAILED");
+    }
+
+    // 2b. CreateFileW (other code paths)
+    auto fnCreate = GetProcAddress(kernel32, "CreateFileW");
+    if (fnCreate) {
+        if (MH_CreateHook(fnCreate, CreateFileW_Hook,
+                reinterpret_cast<LPVOID*>(&CreateFileW_Original)) == MH_OK &&
+            MH_EnableHook(fnCreate) == MH_OK)
+            _LOG("[Hook] CreateFileW hooked");
+        else
+            _LOG("[Hook] CreateFileW hook FAILED");
+    }
+
+    // 3. ReadFile — try kernelbase first (actual implementation), fall back to kernel32
+    HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
+    FARPROC fnRead = kernelbase ? GetProcAddress(kernelbase, "ReadFile") : nullptr;
+    if (!fnRead) fnRead = GetProcAddress(kernel32, "ReadFile");
+    if (fnRead) {
+        if (MH_CreateHook(fnRead, ReadFile_Hook,
+                reinterpret_cast<LPVOID*>(&ReadFile_Original)) == MH_OK &&
+            MH_EnableHook(fnRead) == MH_OK)
+            _LOG("[Hook] ReadFile hooked (%s)", kernelbase ? "kernelbase" : "kernel32");
+        else
+            _LOG("[Hook] ReadFile hook FAILED");
+    }
+
+    // 4. GetOverlappedResult — try kernelbase first
+    FARPROC fnOverlapped = kernelbase ? GetProcAddress(kernelbase, "GetOverlappedResult") : nullptr;
+    if (!fnOverlapped) fnOverlapped = GetProcAddress(kernel32, "GetOverlappedResult");
+    if (fnOverlapped) {
+        if (MH_CreateHook(fnOverlapped, GetOverlappedResult_Hook,
+                reinterpret_cast<LPVOID*>(&GetOverlappedResult_Original)) == MH_OK &&
+            MH_EnableHook(fnOverlapped) == MH_OK)
+            _LOG("[Hook] GetOverlappedResult hooked (%s)", kernelbase ? "kernelbase" : "kernel32");
+        else
+            _LOG("[Hook] GetOverlappedResult hook FAILED");
+    }
+}
+
+// ── Utility ──
+static HWND findBG3Window()
+{
+    HWND hw = FindWindowA("SDL_app", nullptr);
+    if (!hw) hw = FindWindowA(nullptr, "Baldur's Gate 3");
+    return hw;
+}
+
 // background listener thread
 static void pipeListenerThread()
 {
@@ -290,8 +656,17 @@ static void pipeListenerThread()
                 _LOG("[PipeClient] Roll result ready: gen=%u die1=%u die2=%u",
                     result.generation, result.die1, result.die2);
 
-                // send "ready" so the tray app clicks the BG3 dice icon
-                sendReady();
+                // trigger the dice roll: triangle injection if controller present, mouse click fallback
+                if (g_hasHidController.load(std::memory_order_relaxed))
+                {
+                    _LOG("[PipeClient] Controller detected — using triangle injection");
+                    requestTrianglePress();
+                }
+                else
+                {
+                    _LOG("[PipeClient] No controller — using mouse click via tray app");
+                    sendReady();
+                }
             }
             // else: server returned an error (e.g. timeout) — pipe is fine, just skip
         }
@@ -314,6 +689,9 @@ static void pipeListenerThread()
 // public API
 void PixelsDiceClient::start()
 {
+    // Hook input APIs for DualSense triangle injection + raw input diagnostics
+    hookAllInput();
+
     g_pipeRunning = true;
     g_pipeListenerThread = std::thread(pipeListenerThread);
 }

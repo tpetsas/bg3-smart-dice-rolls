@@ -68,6 +68,7 @@ struct DialogueRollSession
     RollMode mode = RollMode::Unknown;
     uint32_t dc = 0;
     int32_t modifier = 0;
+
 };
 
 
@@ -311,6 +312,17 @@ namespace SmartDiceRolls {
         char isReplayOrUiFlag)
     {
 
+    // Log call stack when the dice roll is triggered (flag=0)
+    if (isReplayOrUiFlag == 0) {
+        void* stack[32];
+        USHORT frames = CaptureStackBackTrace(0, 32, stack, nullptr);
+        _LOG("[CallStack] ResolveDialogueRoll flag=0, %u frames (base=%p):", frames, (void*)g_base);
+        for (USHORT i = 0; i < frames; i++) {
+            uintptr_t addr = reinterpret_cast<uintptr_t>(stack[i]);
+            uintptr_t rva = addr - g_base;
+            _LOG("[CallStack]   [%u] addr=%p  RVA=+0x%llX", i, stack[i], (unsigned long long)rva);
+        }
+    }
 
     ResolveDialogueRoll_Original(
         rollContext,
