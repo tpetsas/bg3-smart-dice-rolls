@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <vector>
 #include <windows.h>
-#include <shellapi.h>
+#include <tlhelp32.h>
 #include "minhook/include/MinHook.h"
 
 // shared state (defined in SmartDiceRolls.cpp)
@@ -25,8 +25,8 @@ extern SmartDiceResult g_smartDiceResult;
 static constexpr const wchar_t* kPipeName = L"\\\\.\\pipe\\PixelsDiceRoll";
 static constexpr int kMaxConnectAttempts = 5;
 static constexpr int kConnectRetryMs = 2000;
-static constexpr const char* kTrayTaskName = "PixelsTray Service";
-static constexpr const wchar_t* kTrayExePath = L"./mods/PixelsTray/PixelsTray.exe";
+static constexpr const wchar_t* kTrayExePath = L"./mods/PixelsDiceTray/PixelsTray.exe";
+static constexpr const wchar_t* kTrayProcessName = L"PixelsTray.exe";
 
 // internal state
 static HANDLE g_pipe = INVALID_HANDLE_VALUE;
@@ -55,6 +55,11 @@ static std::string jsonStringValue(const std::string& json, const std::string& k
     return json.substr(pos + 1, end - pos - 1);
 }
 
+// forward declaration — defined later in the hook section; used by connectPipe()
+// so the pipe open bypasses our CreateFileW hook.
+using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static CreateFileW_t CreateFileW_Original;
+
 static int jsonIntValue(const std::string& json, const std::string& key, int def = 0)
 {
     std::string needle = "\"" + key + "\"";
@@ -68,15 +73,33 @@ static int jsonIntValue(const std::string& json, const std::string& key, int def
     catch (...) { return def; }
 }
 
-// tray app launcher
-static bool scheduledTaskExists(const char* taskName)
+// check if a process is already running by name
+static bool isProcessRunning(const wchar_t* processName)
 {
-    std::string query = "schtasks /query /TN \"" + std::string(taskName) + "\" >nul 2>&1";
-    int result = WinExec(query.c_str(), SW_HIDE);
-    return (result > 31);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    bool found = false;
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (_wcsicmp(pe.szExeFile, processName) == 0)
+            {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
 }
 
-static bool launchTrayElevated()
+// tray app launcher — CreateProcessW with DETACHED_PROCESS so the child
+// is fully independent from BG3 (no inherited handles, no shared job object,
+// no interaction with hooked shell APIs).
+static bool launchTray()
 {
     wchar_t fullPath[MAX_PATH];
     if (!GetFullPathNameW(kTrayExePath, MAX_PATH, fullPath, nullptr))
@@ -85,40 +108,27 @@ static bool launchTrayElevated()
         return false;
     }
 
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.lpVerb = L"runas";
-    sei.lpFile = fullPath;
-    sei.nShow = SW_HIDE;
-    sei.fMask = SEE_MASK_NO_CONSOLE;
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
 
-    if (!ShellExecuteExW(&sei))
+    PROCESS_INFORMATION pi = {};
+    BOOL ok = CreateProcessW(
+        fullPath, nullptr, nullptr, nullptr,
+        FALSE,  // do NOT inherit handles
+        DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP,
+        nullptr, nullptr, &si, &pi);
+
+    if (!ok)
     {
-        _LOG("[PipeClient] ShellExecuteEx failed: %lu", GetLastError());
+        _LOG("[PipeClient] CreateProcessW failed: %lu", GetLastError());
         return false;
     }
+
+    _LOG("[PipeClient] PixelsTray launched (PID %lu)", pi.dwProcessId);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
     return true;
-}
-
-static bool launchTrayTaskOrElevated()
-{
-    if (scheduledTaskExists(kTrayTaskName))
-    {
-        std::string cmd = "schtasks /run /TN \"" + std::string(kTrayTaskName) + "\" /I";
-        _LOG("[PipeClient] Running task: %s", cmd.c_str());
-        int result = WinExec(cmd.c_str(), SW_HIDE);
-        if (result > 31)
-        {
-            _LOG("[PipeClient] Tray task launched successfully");
-            return true;
-        }
-        _LOG("[PipeClient] Task run failed (code %d), falling back to elevation", result);
-    }
-    else
-    {
-        _LOG("[PipeClient] Scheduled task not found, falling back to elevation");
-    }
-
-    return launchTrayElevated();
 }
 
 // pipe connection
@@ -126,7 +136,10 @@ static bool connectPipe()
 {
     for (int attempt = 0; attempt < kMaxConnectAttempts; attempt++)
     {
-        HANDLE pipe = CreateFileW(
+        // Use the original (unhooked) CreateFileW if available, so the pipe
+        // connection never travels through our HID hook layer.
+        auto openFn = CreateFileW_Original ? CreateFileW_Original : CreateFileW;
+        HANDLE pipe = openFn(
             kPipeName,
             GENERIC_READ | GENERIC_WRITE,
             0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -142,8 +155,15 @@ static bool connectPipe()
         DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND && attempt == 0)
         {
-            _LOG("[PipeClient] Pipe not found, attempting to launch tray app...");
-            launchTrayTaskOrElevated();
+            if (isProcessRunning(kTrayProcessName))
+            {
+                _LOG("[PipeClient] PixelsTray is running but pipe not ready yet, waiting...");
+            }
+            else
+            {
+                _LOG("[PipeClient] Pipe not found, launching tray app...");
+                launchTray();
+            }
         }
         else if (err == ERROR_PIPE_BUSY)
         {
@@ -360,12 +380,10 @@ static void requestTrianglePress()
 // GetOverlappedResult to modify completed reads.
 
 using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using ReadFile_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 using GetOverlappedResult_t = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
 
 static CreateFileA_t CreateFileA_Original = nullptr;
-static CreateFileW_t CreateFileW_Original = nullptr;
 static ReadFile_t ReadFile_Original = nullptr;
 static GetOverlappedResult_t GetOverlappedResult_Original = nullptr;
 
@@ -497,31 +515,14 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
 
 static std::atomic<bool> g_gorLoggedOnce{false};
 
-static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlapped,
-    LPDWORD lpNumberOfBytesTransferred, BOOL bWait)
+// Separate function for SEH — MSVC forbids __try in functions with C++ destructors.
+// This function must NOT use any C++ objects (std::string, lock_guard, etc.).
+static void processCompletedHidRead(HANDLE hFile, LPVOID buffer, LPDWORD lpNumberOfBytesTransferred)
 {
-    BOOL result = GetOverlappedResult_Original(hFile, lpOverlapped,
-        lpNumberOfBytesTransferred, bWait);
-
-    if (!result || !lpOverlapped)
-        return result;
-
-    LPVOID buffer = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_pendingReadsMutex);
-        auto it = g_pendingReads.find(lpOverlapped);
-        if (it != g_pendingReads.end())
-        {
-            buffer = it->second;
-            g_pendingReads.erase(it);
-        }
-    }
-
-    if (buffer)
+    __try
     {
         BYTE* buf = static_cast<BYTE*>(buffer);
 
-        // Diagnostic: log once when an async DualSense read completes
         if (buf[0] == 0x01 && !g_gorLoggedOnce.load(std::memory_order_relaxed))
         {
             g_gorLoggedOnce.store(true, std::memory_order_relaxed);
@@ -545,6 +546,35 @@ static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlap
             }
         }
     }
+    __except(EXCEPTION_EXECUTE_HANDLER)
+    {
+        _LOG("[HID] SEH: access violation in GetOverlappedResult_Hook (buffer=%p handle=%p)",
+            buffer, hFile);
+    }
+}
+
+static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlapped,
+    LPDWORD lpNumberOfBytesTransferred, BOOL bWait)
+{
+    BOOL result = GetOverlappedResult_Original(hFile, lpOverlapped,
+        lpNumberOfBytesTransferred, bWait);
+
+    if (!result || !lpOverlapped)
+        return result;
+
+    LPVOID buffer = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingReadsMutex);
+        auto it = g_pendingReads.find(lpOverlapped);
+        if (it != g_pendingReads.end())
+        {
+            buffer = it->second;
+            g_pendingReads.erase(it);
+        }
+    }
+
+    if (buffer)
+        processCompletedHidRead(hFile, buffer, lpNumberOfBytesTransferred);
 
     return result;
 }
