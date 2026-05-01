@@ -289,13 +289,56 @@ static GetRawInputData_t GetRawInputData_Original = nullptr;
 static std::atomic<bool> g_hasHidController{false};  // true once we see DualSense input
 static HANDLE g_dualsenseDevice = nullptr;             // cached RawInput device handle (diagnostic only)
 
-// Global injection counter — set by requestTrianglePress(), consumed by GetOverlappedResult_Hook.
-// We use a global counter because the actual reading handles may predate our CreateFile hooks.
-static std::atomic<int> g_injectFrames{0};
+// Time-based injection window — inject into ALL reads until the deadline passes.
+// Multiple handles (Steam + SDL) may read concurrently; a frame counter would be
+// consumed by whichever completes first. A time window ensures all handles see it.
+static std::atomic<ULONGLONG> g_injectUntilTick{0};
+static std::atomic<bool>     g_injectLogged{false};       // log only first injection per window
+static constexpr ULONGLONG kInjectWindowMs       = 50;   // 50ms window — covers several polling cycles
+static constexpr int  kTriangleButtonByteUSB     = 8;    // USB:       report ID 0x01, 64 bytes, buttons at byte 8
+static constexpr int  kTriangleButtonByteBTSimple= 5;    // BT Simple: report ID 0x01, 78 bytes, buttons at byte 5
+static constexpr int  kTriangleButtonByteBTFull  = 9;    // BT Full:   report ID 0x31, 78 bytes, buttons at byte 9
+static constexpr BYTE kTriangleButtonMask        = 0x80; // bit 7 = Triangle
 
-static constexpr int  kTrianglePressReports = 3;   // ~12ms at 250Hz — quick tap, avoids fast-forward
-static constexpr int  kTriangleButtonByte   = 8;   // offset in HID report (byte 8 = dpad + face buttons)
-static constexpr BYTE kTriangleButtonMask   = 0x80; // bit 7 = Triangle
+// CRC32 for DualSense BT Full reports — SDL validates this and discards on mismatch.
+// Standard CRC32 (polynomial 0xEDB88320, same as zlib/Ethernet).
+static uint32_t crc32Table[256];
+static bool     crc32TableBuilt = false;
+
+static void buildCrc32Table()
+{
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+        crc32Table[i] = c;
+    }
+    crc32TableBuilt = true;
+}
+
+static uint32_t crc32Compute(uint32_t crc, const BYTE* data, size_t len)
+{
+    if (!crc32TableBuilt) buildCrc32Table();
+    for (size_t i = 0; i < len; i++)
+        crc = crc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+
+// Recompute and patch the CRC32 at the end of a BT Full report (78 bytes).
+// Seed: CRC32 of [0xA1], then hash report bytes [0..73], store in [74..77] LE.
+static void fixBtFullCrc(BYTE* report, DWORD reportSize)
+{
+    if (reportSize < 78) return;
+    BYTE seed = 0xA1;  // BT HID input report header
+    uint32_t crc = crc32Compute(0xFFFFFFFF, &seed, 1);
+    crc = crc32Compute(crc, report, 74);
+    crc ^= 0xFFFFFFFF;
+    report[74] = (BYTE)(crc);
+    report[75] = (BYTE)(crc >> 8);
+    report[76] = (BYTE)(crc >> 16);
+    report[77] = (BYTE)(crc >> 24);
+}
 
 // Check if a raw input device is a DualSense controller
 static bool isDualSenseDevice(HANDLE hDevice)
@@ -335,7 +378,7 @@ static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
         RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(pData);
 
         if (raw->header.dwType == RIM_TYPEHID &&
-            raw->data.hid.dwSizeHid > static_cast<DWORD>(kTriangleButtonByte) &&
+            raw->data.hid.dwSizeHid > static_cast<DWORD>(kTriangleButtonByteBTFull) &&
             raw->data.hid.dwCount > 0)
         {
             // Identify the DualSense device on first HID report
@@ -405,8 +448,10 @@ static std::unordered_map<LPOVERLAPPED, PendingRead> g_pendingReads;
 
 static void requestTrianglePress()
 {
-    g_injectFrames.store(kTrianglePressReports, std::memory_order_relaxed);
-    _LOG("[RawInput] Triangle press requested (%d reports)", kTrianglePressReports);
+    ULONGLONG deadline = GetTickCount64() + kInjectWindowMs;
+    g_injectLogged.store(false, std::memory_order_relaxed);
+    g_injectUntilTick.store(deadline, std::memory_order_relaxed);
+    _LOG("[RawInput] Triangle press requested (%llums window)", kInjectWindowMs);
 }
 
 static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
@@ -477,8 +522,8 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
                                        lpNumberOfBytesRead, lpOverlapped);
     DWORD savedErr = GetLastError();
 
-    // Only process 64-byte reads (DualSense USB HID report size)
-    if (nNumberOfBytesToRead != 64 || !lpBuffer)
+    // Accept 64-byte (USB) and 78-byte (BT) DualSense HID reports
+    if ((nNumberOfBytesToRead != 64 && nNumberOfBytesToRead != 78) || !lpBuffer)
     {
         SetLastError(savedErr);
         return result;
@@ -486,9 +531,17 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
 
     if (result)
     {
-        // Synchronous completion — consumed by Steam, not SDL. Do not inject.
+        // Synchronous completion
         BYTE* buf = static_cast<BYTE*>(lpBuffer);
-        if (buf[0] == 0x01)
+        DWORD bytes = lpNumberOfBytesRead ? *lpNumberOfBytesRead : nNumberOfBytesToRead;
+
+        int  buttonByte = -1;
+        const char* conn = "?";
+        if (buf[0] == 0x31)                    { buttonByte = kTriangleButtonByteBTFull;   conn = "BT-Full"; }
+        else if (buf[0] == 0x01 && bytes > 64) { buttonByte = kTriangleButtonByteBTSimple; conn = "BT-Simple"; }
+        else if (buf[0] == 0x01)               { buttonByte = kTriangleButtonByteUSB;      conn = "USB"; }
+
+        if (buttonByte >= 0)
         {
             g_hasHidController.store(true, std::memory_order_relaxed);
             bool firstForHandle = false;
@@ -502,10 +555,21 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
                 int pos = 0;
                 for (int i = 0; i < 10 && pos < 60; i++)
                     pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
-                _LOG("[HID] DualSense 64-byte read (sync): handle=%p data=%s", hFile, hex);
+                _LOG("[HID] DualSense %s read (sync, %u bytes): handle=%p data=%s",
+                    conn, bytes, hFile, hex);
             }
-            // NOTE: do NOT inject here — sync reads are consumed by Steam,
-            // not SDL. Injection happens in GetOverlappedResult_Hook only.
+
+            // Inject on sync path too — SDL may use sync reads for BT
+            ULONGLONG now = GetTickCount64();
+            ULONGLONG deadline = g_injectUntilTick.load(std::memory_order_relaxed);
+            if (now < deadline)
+            {
+                buf[buttonByte] |= kTriangleButtonMask;
+                if (buf[0] == 0x31) fixBtFullCrc(buf, bytes);  // BT Full has CRC32
+                if (!g_injectLogged.exchange(true, std::memory_order_relaxed))
+                    _LOG("[HID] Triangle injected (%s, handle=%p, byte[%d]: 0x%02X)",
+                        conn, hFile, buttonByte, buf[buttonByte]);
+            }
         }
     }
     else if (lpOverlapped && savedErr == ERROR_IO_PENDING)
@@ -521,7 +585,8 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
             firstForHandle = g_readFileLoggedHandles.insert(hFile).second;
         }
         if (firstForHandle)
-            _LOG("[HID] 64-byte overlapped read pending: handle=%p ol=%p", hFile, lpOverlapped);
+            _LOG("[HID] %u-byte overlapped read pending: handle=%p ol=%p",
+                nNumberOfBytesToRead, hFile, lpOverlapped);
     }
 
     SetLastError(savedErr);
@@ -555,11 +620,23 @@ static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlap
     {
         BYTE* buf = static_cast<BYTE*>(pending.buffer);
 
-        if (buf[0] == 0x01)  // DualSense USB input report
+        // Determine DualSense report format from report ID + transfer size:
+        //   USB:       0x01, 64 bytes → buttons at byte 8
+        //   BT Simple: 0x01, 78 bytes → buttons at byte 5
+        //   BT Full:   0x31, 78 bytes → buttons at byte 9
+        DWORD bytes = lpNumberOfBytesTransferred ? *lpNumberOfBytesTransferred : 0;
+        int  buttonByte = -1;
+        const char* conn = "?";
+
+        if (buf[0] == 0x31)               { buttonByte = kTriangleButtonByteBTFull;   conn = "BT-Full"; }
+        else if (buf[0] == 0x01 && bytes > 64) { buttonByte = kTriangleButtonByteBTSimple; conn = "BT-Simple"; }
+        else if (buf[0] == 0x01)          { buttonByte = kTriangleButtonByteUSB;      conn = "USB"; }
+
+        if (buttonByte >= 0)
         {
             g_hasHidController.store(true, std::memory_order_relaxed);
 
-            // Diagnostic: log first async completion per handle
+            // Log first async completion per handle
             bool firstForHandle = false;
             {
                 std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
@@ -567,28 +644,24 @@ static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlap
             }
             if (firstForHandle)
             {
-                DWORD bytes = lpNumberOfBytesTransferred ? *lpNumberOfBytesTransferred : 0;
                 char hex[64] = {};
                 int pos = 0;
                 for (int i = 0; i < 10 && pos < 60; i++)
                     pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
-                _LOG("[HID] Async DualSense read completed: handle=%p bytes=%u data=%s",
-                    pending.handle, bytes, hex);
+                _LOG("[HID] Async DualSense %s read completed: handle=%p bytes=%u data=%s",
+                    conn, pending.handle, bytes, hex);
             }
 
-            // Consume global injection budget
-            if (g_injectFrames.load(std::memory_order_relaxed) > 0)
+            // Inject triangle during the active time window
+            ULONGLONG now = GetTickCount64();
+            ULONGLONG deadline = g_injectUntilTick.load(std::memory_order_relaxed);
+            if (now < deadline)
             {
-                int remaining = g_injectFrames.fetch_sub(1, std::memory_order_relaxed);
-                if (remaining > 0)
-                {
-                    buf[kTriangleButtonByte] |= kTriangleButtonMask;
-                    if (remaining == kTrianglePressReports)
-                        _LOG("[HID] Triangle injection STARTED (handle=%p, byte[%d]: 0x%02X)",
-                            pending.handle, kTriangleButtonByte, buf[kTriangleButtonByte]);
-                    if (remaining == 1)
-                        _LOG("[HID] Triangle injection ENDED (handle=%p)", pending.handle);
-                }
+                buf[buttonByte] |= kTriangleButtonMask;
+                if (buf[0] == 0x31) fixBtFullCrc(buf, bytes);  // BT Full has CRC32
+                if (!g_injectLogged.exchange(true, std::memory_order_relaxed))
+                    _LOG("[HID] Triangle injected (%s, handle=%p, byte[%d]: 0x%02X)",
+                        conn, pending.handle, buttonByte, buf[buttonByte]);
             }
         }
     }
