@@ -1,3 +1,9 @@
 [submodule "src/minhook"]
 	path = src/minhook
 	url = git@github.com:TsudaKageyu/minhook.git
+[submodule "src/PixelsCpp"]
+	path = src/PixelsCpp
+	url = https://github.com/tpetsas/PixelsCpp.git
+[submodule "src/o-negative"]
+	path = src/o-negative
+	url = https://github.com/tpetsas/o-negative.git

@@ -4,6 +4,8 @@
  */
 
 #include "SmartDiceRolls.h"
+#include "SmartDiceResult.h"
+#include "PixelsDiceClient.h"
 
 #include "Logger.h"
 #include "Config.h"
@@ -15,8 +17,9 @@
 #include <intrin.h>
 #include <cstdint>
 #include <cstdio>
-#include <windows.h>
 #include <mutex>
+#include <string>
+#include <windows.h>
 
 #define INI_LOCATION "./mods/smart-dice-rolls-mod.ini"
 
@@ -55,15 +58,6 @@ static uint32_t ClampD20(uint32_t x)
     return x;
 }
 
-struct SmartDiceResult
-{
-    bool ready = false;          // tray app has provided a result
-    uint32_t generation = 0;     // which dialogue-roll attempt this belongs to
-
-    uint32_t die1 = 0;           // normal: use die1 only
-    uint32_t die2 = 0;           // advantage/disadvantage: second die
-};
-
 struct DialogueRollSession
 {
     bool active = false;               // we are inside a dialogue-roll lifecycle
@@ -74,21 +68,22 @@ struct DialogueRollSession
     RollMode mode = RollMode::Unknown;
     uint32_t dc = 0;
     int32_t modifier = 0;
+
 };
 
 
-static std::mutex g_dialogueRollMutex;
+std::mutex g_dialogueRollMutex;
 static DialogueRollSession g_dialogueRoll{}; // all initialized to zero
-static SmartDiceResult g_smartDiceResult{};
+SmartDiceResult g_smartDiceResult{};
 
 static void ResetDialogueRollSession()
 {
     g_dialogueRoll.active = false;
     g_dialogueRoll.waitingForResolution = false;
     g_dialogueRoll.rerollPending = false;
-    g_dialogueRoll.mode = RollMode::Unknown;
-    g_dialogueRoll.dc = 0;
-    g_dialogueRoll.modifier = 0;
+    // Keep mode, dc, modifier — Reroll_Hook needs them if the player
+    // clicks "Roll Again" after a failed check. They are overwritten
+    // when the next isDialoguePrompt fires.
 }
 
 
@@ -213,14 +208,11 @@ namespace SmartDiceRolls {
             g_smartDiceResult.die1 = 0;
             g_smartDiceResult.die2 = 0;
 
-            // TODO: notify tray app that the player should roll
+            // Notify tray app â€” reuse the mode from the current session
+            PixelsDiceClient::notifyTrayForRoll(RollModeName(g_dialogueRoll.mode), g_dialogueRoll.generation);
         }
 
-        // clear previous pending physical dice here and notify tray app
-        // for new roll
-
         _LOG("Reroll hook");
-        _LOG("Notify tray app for rolling!");
         Reroll_Original(a1);
     }
 
@@ -320,6 +312,17 @@ namespace SmartDiceRolls {
         char isReplayOrUiFlag)
     {
 
+    // Log call stack when the dice roll is triggered (flag=0)
+    if (isReplayOrUiFlag == 0) {
+        void* stack[32];
+        USHORT frames = CaptureStackBackTrace(0, 32, stack, nullptr);
+        _LOG("[CallStack] ResolveDialogueRoll flag=0, %u frames (base=%p):", frames, (void*)g_base);
+        for (USHORT i = 0; i < frames; i++) {
+            uintptr_t addr = reinterpret_cast<uintptr_t>(stack[i]);
+            uintptr_t rva = addr - g_base;
+            _LOG("[CallStack]   [%u] addr=%p  RVA=+0x%llX", i, stack[i], (unsigned long long)rva);
+        }
+    }
 
     ResolveDialogueRoll_Original(
         rollContext,
@@ -362,23 +365,12 @@ namespace SmartDiceRolls {
         g_smartDiceResult.die1 = 0;
         g_smartDiceResult.die2 = 0;
 
-        // TODO: notify tray app here
-        _LOG("Notify tray app for rolling!");
-
-        // when the tray app replies, a thread should receive the response
-        // and only fill g_smartDiceResult; those data will be patched in the
-        // next ResolveDialogueRoll_Hook
-
-        // we should do something like this:
-        /*{
-            std::lock_guard<std::mutex> lock(g_dialogueRollMutex);
-
-            g_smartDiceResult.ready = true;
-            g_smartDiceResult.generation = incomingGeneration;
-            g_smartDiceResult.die1 = incomingDie1;
-            g_smartDiceResult.die2 = incomingDie2;
-        }*/
+        // Notify tray app to start collecting rolls
+        PixelsDiceClient::notifyTrayForRoll(RollModeName(g_dialogueRoll.mode), g_dialogueRoll.generation);
+        _LOG("Notify tray app for rolling! mode=%s gen=%u",
+            RollModeName(g_dialogueRoll.mode), g_dialogueRoll.generation);
     }
+    _LOG("* isDialoguePrompt: %d, isDialogueFollowup: %d", isDialoguePrompt, isDialogueFollowup);
 
     if (!isDialogueFollowup && !isDialoguePrompt) {
 
@@ -405,6 +397,14 @@ namespace SmartDiceRolls {
 
     SmartDiceResult dice{};
     DialogueRollSession session{};
+
+
+    // perhaps this should be done during patching?
+    //if (isDialogueFollowup) {
+    //    ResetDialogueRollSession();
+    //}
+
+    // This is a dialogue follow up
 
     // patch only if you have pending physical dice for the current dialogue session
     {
@@ -597,6 +597,9 @@ _LOG("[ResolveRoll] ctx=%p state=%p uiFlag=%d rawMode=%u dc=%u mod=%d",
             _LOG("FATAL: Incompatible version");
             return;
         }
+
+        // Start the pipe client thread to communicate with PixelsTray
+        PixelsDiceClient::start();
 
         _LOG("Ready.");
     }
