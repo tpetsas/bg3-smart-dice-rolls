@@ -15,6 +15,7 @@
 
 // for getting the caller
 #include <intrin.h>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
