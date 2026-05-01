@@ -368,10 +368,6 @@ static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
     return result;
 }
 
-static std::atomic<int> g_readFile64Count{0};  // count 64-byte reads for diagnostics
-static std::atomic<int> g_totalReadFileCalls{0}; // count ALL ReadFile calls
-static std::atomic<int> g_dsReadFileCalls{0};    // count ReadFile calls on tracked DS handles
-
 // ── HID file hooks — intercept SDL's hidapi reads from the DualSense ──
 //
 // SDL reads the DualSense via hidapi which uses ReadFile with overlapped I/O.
@@ -410,11 +406,7 @@ static std::unordered_map<LPOVERLAPPED, PendingRead> g_pendingReads;
 static void requestTrianglePress()
 {
     g_injectFrames.store(kTrianglePressReports, std::memory_order_relaxed);
-    _LOG("[RawInput] Triangle press requested (%d reports), reads: total=%d ds=%d 64b=%d",
-        kTrianglePressReports,
-        g_totalReadFileCalls.load(std::memory_order_relaxed),
-        g_dsReadFileCalls.load(std::memory_order_relaxed),
-        g_readFile64Count.load(std::memory_order_relaxed));
+    _LOG("[RawInput] Triangle press requested (%d reports)", kTrianglePressReports);
 }
 
 static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
@@ -439,9 +431,7 @@ static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
             }
             g_hasHidController.store(true, std::memory_order_relaxed);
 
-            char narrow[512] = {};
-            WideCharToMultiByte(CP_UTF8, 0, lpFileName, -1, narrow, sizeof(narrow), nullptr, nullptr);
-            _LOG("[HID] DualSense file opened: handle=%p path=%s", result, narrow);
+            // No per-open logging in release — handles are transient (enumeration only)
         }
     }
 
@@ -469,7 +459,7 @@ static HANDLE WINAPI CreateFileA_Hook(LPCSTR lpFileName, DWORD dwDesiredAccess,
                 g_dualsenseHandles.push_back(result);
             }
             g_hasHidController.store(true, std::memory_order_relaxed);
-            _LOG("[HID] DualSense file opened (A): handle=%p path=%s", result, lpFileName);
+            // No per-open logging in release — handles are transient (enumeration only)
         }
     }
 
@@ -487,25 +477,12 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
                                        lpNumberOfBytesRead, lpOverlapped);
     DWORD savedErr = GetLastError();
 
-    g_totalReadFileCalls.fetch_add(1, std::memory_order_relaxed);
-
-    // Diagnostic: log ANY ReadFile on a tracked DualSense handle (regardless of size)
-    if (lpBuffer && isDualsenseHandle(hFile))
-    {
-        int dsCount = g_dsReadFileCalls.fetch_add(1, std::memory_order_relaxed);
-        if (dsCount < 5)  // log first 5
-            _LOG("[HID] ReadFile on DS handle=%p size=%u overlapped=%s result=%d err=%u",
-                hFile, nNumberOfBytesToRead, lpOverlapped ? "yes" : "no", result, savedErr);
-    }
-
     // Only process 64-byte reads (DualSense USB HID report size)
     if (nNumberOfBytesToRead != 64 || !lpBuffer)
     {
         SetLastError(savedErr);
         return result;
     }
-
-    g_readFile64Count.fetch_add(1, std::memory_order_relaxed);
 
     if (result)
     {
@@ -634,12 +611,6 @@ static BOOL WINAPI CloseHandle_Hook(HANDLE hObject)
     }
     if (wasDualsense)
     {
-        size_t remaining = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
-            remaining = g_dualsenseHandles.size();
-        }
-        _LOG("[HID] DualSense handle closed: handle=%p remaining=%zu", hObject, remaining);
         {
             std::lock_guard<std::mutex> lock(g_pendingMutex);
             for (auto it = g_pendingReads.begin(); it != g_pendingReads.end(); )
