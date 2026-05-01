@@ -1,12 +1,16 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 set(CMAKE_CXX_STANDARD 20)
 
 project(bg3-smart-dice-rolls)
 
-# Set the DLL output directory
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+# Submodule: o-negative (xinput1_4.dll proxy)
+set(BUILD_XINPUT_PROXY ON CACHE BOOL "Build xinput1_4 proxy" FORCE)
+add_subdirectory(src/o-negative)
 
-# Add the source files, including dllmain.cpp
+# Submodule: PixelsCpp (PixelsTray.exe tray app)
+add_subdirectory(src/PixelsCpp)
+
+# Main mod DLL
 add_library(smart-dice-rolls SHARED
     src/dllmain.cpp
     src/Logger.cpp
@@ -26,5 +30,22 @@ target_link_libraries(smart-dice-rolls)
 
 target_include_directories(smart-dice-rolls PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+)
+
+# Put all key outputs in the same directory
+set_target_properties(smart-dice-rolls PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+set_target_properties(PixelsTray PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+set_target_properties(xinput1_4 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
 
