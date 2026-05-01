@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <windows.h>
 #include <tlhelp32.h>
@@ -286,8 +287,12 @@ using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT hRawInput, UINT uiCommand,
 static GetRawInputData_t GetRawInputData_Original = nullptr;
 
 static std::atomic<bool> g_hasHidController{false};  // true once we see DualSense input
-static std::atomic<int>  g_injectFrames{0};           // >0 = inject triangle for N more reports
-static HANDLE g_dualsenseDevice = nullptr;             // cached device handle for DualSense
+static HANDLE g_dualsenseDevice = nullptr;             // cached RawInput device handle (diagnostic only)
+
+// Per-handle injection counter — each tracked DualSense file handle gets its own frame budget
+// so a triangle press lands on every controller, not just whichever completes its read first.
+static std::mutex                      g_injectMutex;
+static std::unordered_map<HANDLE, int> g_injectFramesByHandle;
 
 static constexpr int  kTrianglePressReports = 3;   // ~12ms at 250Hz — quick tap, avoids fast-forward
 static constexpr int  kTriangleButtonByte   = 8;   // offset in HID report (byte 8 = dpad + face buttons)
@@ -366,26 +371,21 @@ static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
 
 static std::atomic<int> g_readFile64Count{0};  // count 64-byte reads for diagnostics
 
-static void requestTrianglePress()
-{
-    g_injectFrames.store(kTrianglePressReports, std::memory_order_relaxed);
-    _LOG("[RawInput] Triangle press requested (%d reports), 64-byte reads so far: %d",
-        kTrianglePressReports, g_readFile64Count.load(std::memory_order_relaxed));
-}
-
 // ── HID file hooks — intercept SDL's hidapi reads from the DualSense ──
 //
 // SDL reads the DualSense via hidapi which uses ReadFile with overlapped I/O.
 // We hook CreateFileW to identify the DualSense handle, then ReadFile +
 // GetOverlappedResult to modify completed reads.
 
-using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-using ReadFile_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using CreateFileA_t        = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using ReadFile_t            = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 using GetOverlappedResult_t = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
+using CloseHandle_t         = BOOL(WINAPI*)(HANDLE);
 
-static CreateFileA_t CreateFileA_Original = nullptr;
-static ReadFile_t ReadFile_Original = nullptr;
+static CreateFileA_t        CreateFileA_Original        = nullptr;
+static ReadFile_t            ReadFile_Original           = nullptr;
 static GetOverlappedResult_t GetOverlappedResult_Original = nullptr;
+static CloseHandle_t         CloseHandle_Original        = nullptr;
 
 // SDL opens the DualSense multiple times — track all handles
 static std::mutex g_dsHandlesMutex;
@@ -399,10 +399,29 @@ static bool isDualsenseHandle(HANDLE h)
     return false;
 }
 
-// Track all pending 64-byte overlapped reads — keyed by LPOVERLAPPED so multiple
-// concurrent handles (e.g. two DualSense controllers in co-op) are all covered.
-static std::mutex g_pendingReadsMutex;
-static std::unordered_map<LPOVERLAPPED, LPVOID> g_pendingReads;
+// Track every pending overlapped DualSense read, keyed by OVERLAPPED*.
+// Multiple controllers issue async reads in parallel, each with its own OVERLAPPED* —
+// we must remember the buffer for each so GetOverlappedResult can find and inject into it.
+struct PendingRead { LPVOID buffer; HANDLE handle; };
+static std::mutex                                    g_pendingMutex;
+static std::unordered_map<LPOVERLAPPED, PendingRead> g_pendingReads;
+
+static void requestTrianglePress()
+{
+    std::vector<HANDLE> handlesSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
+        handlesSnapshot = g_dualsenseHandles;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_injectMutex);
+        for (HANDLE h : handlesSnapshot)
+            g_injectFramesByHandle[h] = kTrianglePressReports;
+    }
+    _LOG("[RawInput] Triangle press requested (%d reports x %zu handles), 64-byte reads so far: %d",
+        kTrianglePressReports, handlesSnapshot.size(),
+        g_readFile64Count.load(std::memory_order_relaxed));
+}
 
 static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
     DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes,
@@ -463,29 +482,40 @@ static HANDLE WINAPI CreateFileA_Hook(LPCSTR lpFileName, DWORD dwDesiredAccess,
     return result;
 }
 
-static std::atomic<bool> g_readFileLoggedOnce{false};
+static std::mutex                 g_loggedHandlesMutex;
+static std::unordered_set<HANDLE> g_readFileLoggedHandles;
+static std::unordered_set<HANDLE> g_gorLoggedHandles;
 
 static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
     LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
 {
-    BOOL result = ReadFile_Original(hFile, lpBuffer, nNumberOfBytesToRead,
-        lpNumberOfBytesRead, lpOverlapped);
+    BOOL  result   = ReadFile_Original(hFile, lpBuffer, nNumberOfBytesToRead,
+                                       lpNumberOfBytesRead, lpOverlapped);
+    DWORD savedErr = GetLastError();
 
-    // Fast path: only care about 64-byte reads (DualSense USB HID report size)
-    if (nNumberOfBytesToRead != 64 || !lpBuffer)
+    // Fast path: only care about 64-byte reads on a tracked DualSense handle
+    if (nNumberOfBytesToRead != 64 || !lpBuffer || !isDualsenseHandle(hFile))
+    {
+        SetLastError(savedErr);
         return result;
+    }
 
     g_readFile64Count.fetch_add(1, std::memory_order_relaxed);
 
     if (result)
     {
-        // Synchronous completion — check if it looks like a DualSense report
+        // Synchronous completion — consumed by Steam, not SDL. Do not inject.
         BYTE* buf = static_cast<BYTE*>(lpBuffer);
-        if (buf[0] == 0x01)  // DualSense USB report ID
+        if (buf[0] == 0x01)
         {
-            if (!g_readFileLoggedOnce.exchange(true, std::memory_order_relaxed))
+            g_hasHidController.store(true, std::memory_order_relaxed);
+            bool firstForHandle = false;
             {
-                g_hasHidController.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
+                firstForHandle = g_readFileLoggedHandles.insert(hFile).second;
+            }
+            if (firstForHandle)
+            {
                 char hex[64] = {};
                 int pos = 0;
                 for (int i = 0; i < 10 && pos < 60; i++)
@@ -496,87 +526,133 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
             // not SDL. Injection happens in GetOverlappedResult_Hook only.
         }
     }
-    else if (lpOverlapped && GetLastError() == ERROR_IO_PENDING)
+    else if (lpOverlapped && savedErr == ERROR_IO_PENDING)
     {
-        // Async — record so GetOverlappedResult_Hook can inject when it completes
-        DWORD savedErr = GetLastError();
+        // Async — record buffer keyed by OVERLAPPED* for GetOverlappedResult to find
         {
-            std::lock_guard<std::mutex> lock(g_pendingReadsMutex);
-            g_pendingReads[lpOverlapped] = lpBuffer;
+            std::lock_guard<std::mutex> lock(g_pendingMutex);
+            g_pendingReads[lpOverlapped] = PendingRead{ lpBuffer, hFile };
         }
-        SetLastError(savedErr);
-
-        if (!g_readFileLoggedOnce.exchange(true, std::memory_order_relaxed))
-            _LOG("[HID] 64-byte overlapped read pending: handle=%p", hFile);
+        bool firstForHandle = false;
+        {
+            std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
+            firstForHandle = g_readFileLoggedHandles.insert(hFile).second;
+        }
+        if (firstForHandle)
+            _LOG("[HID] 64-byte overlapped read pending: handle=%p ol=%p", hFile, lpOverlapped);
     }
 
+    SetLastError(savedErr);
     return result;
-}
-
-static std::atomic<bool> g_gorLoggedOnce{false};
-
-// Separate function for SEH — MSVC forbids __try in functions with C++ destructors.
-// This function must NOT use any C++ objects (std::string, lock_guard, etc.).
-static void processCompletedHidRead(HANDLE hFile, LPVOID buffer, LPDWORD lpNumberOfBytesTransferred)
-{
-    __try
-    {
-        BYTE* buf = static_cast<BYTE*>(buffer);
-
-        if (buf[0] == 0x01 && !g_gorLoggedOnce.load(std::memory_order_relaxed))
-        {
-            g_gorLoggedOnce.store(true, std::memory_order_relaxed);
-            DWORD bytes = lpNumberOfBytesTransferred ? *lpNumberOfBytesTransferred : 0;
-            char hex[64] = {};
-            int pos = 0;
-            for (int i = 0; i < 10 && pos < 60; i++)
-                pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
-            _LOG("[HID] Async DualSense read completed: handle=%p bytes=%u data=%s",
-                hFile, bytes, hex);
-            g_hasHidController.store(true, std::memory_order_relaxed);
-        }
-
-        if (buf[0] == 0x01 && g_injectFrames.load(std::memory_order_relaxed) > 0)
-        {
-            if (g_injectFrames.fetch_sub(1, std::memory_order_relaxed) > 0)
-            {
-                buf[kTriangleButtonByte] |= kTriangleButtonMask;
-                _LOG("[HID] Triangle injected (handle=%p, byte[%d]: 0x%02X)",
-                    hFile, kTriangleButtonByte, buf[kTriangleButtonByte]);
-            }
-        }
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER)
-    {
-        _LOG("[HID] SEH: access violation in GetOverlappedResult_Hook (buffer=%p handle=%p)",
-            buffer, hFile);
-    }
 }
 
 static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlapped,
     LPDWORD lpNumberOfBytesTransferred, BOOL bWait)
 {
-    BOOL result = GetOverlappedResult_Original(hFile, lpOverlapped,
-        lpNumberOfBytesTransferred, bWait);
+    BOOL  result   = GetOverlappedResult_Original(hFile, lpOverlapped,
+                                                  lpNumberOfBytesTransferred, bWait);
+    DWORD savedErr = GetLastError();
 
-    if (!result || !lpOverlapped)
-        return result;
+    if (!result || !lpOverlapped) { SetLastError(savedErr); return result; }
 
-    LPVOID buffer = nullptr;
+    // Pop the pending entry for this OVERLAPPED* — each controller has its own entry
+    PendingRead pending{ nullptr, nullptr };
+    bool found = false;
     {
-        std::lock_guard<std::mutex> lock(g_pendingReadsMutex);
+        std::lock_guard<std::mutex> lock(g_pendingMutex);
         auto it = g_pendingReads.find(lpOverlapped);
         if (it != g_pendingReads.end())
         {
-            buffer = it->second;
+            pending = it->second;
             g_pendingReads.erase(it);
+            found = true;
         }
     }
 
-    if (buffer)
-        processCompletedHidRead(hFile, buffer, lpNumberOfBytesTransferred);
+    if (found && pending.buffer)
+    {
+        BYTE* buf = static_cast<BYTE*>(pending.buffer);
 
+        if (buf[0] == 0x01)  // DualSense USB input report
+        {
+            g_hasHidController.store(true, std::memory_order_relaxed);
+
+            // Diagnostic: log first async completion per handle
+            bool firstForHandle = false;
+            {
+                std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
+                firstForHandle = g_gorLoggedHandles.insert(pending.handle).second;
+            }
+            if (firstForHandle)
+            {
+                DWORD bytes = lpNumberOfBytesTransferred ? *lpNumberOfBytesTransferred : 0;
+                char hex[64] = {};
+                int pos = 0;
+                for (int i = 0; i < 10 && pos < 60; i++)
+                    pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
+                _LOG("[HID] Async DualSense read completed: handle=%p bytes=%u data=%s",
+                    pending.handle, bytes, hex);
+            }
+
+            // Consume this handle's per-handle injection budget
+            bool injected = false;
+            int  remaining = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_injectMutex);
+                auto it = g_injectFramesByHandle.find(pending.handle);
+                if (it != g_injectFramesByHandle.end() && it->second > 0)
+                {
+                    remaining = it->second--;
+                    if (it->second == 0) g_injectFramesByHandle.erase(it);
+                    injected = true;
+                }
+            }
+            if (injected)
+            {
+                buf[kTriangleButtonByte] |= kTriangleButtonMask;
+                if (remaining == kTrianglePressReports)
+                    _LOG("[HID] Triangle injection STARTED (handle=%p, byte[%d]: 0x%02X)",
+                        pending.handle, kTriangleButtonByte, buf[kTriangleButtonByte]);
+                if (remaining == 1)
+                    _LOG("[HID] Triangle injection ENDED (handle=%p)", pending.handle);
+            }
+        }
+    }
+
+    SetLastError(savedErr);
     return result;
+}
+
+static BOOL WINAPI CloseHandle_Hook(HANDLE hObject)
+{
+    bool wasDualsense = false;
+    {
+        std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
+        auto it = std::find(g_dualsenseHandles.begin(), g_dualsenseHandles.end(), hObject);
+        if (it != g_dualsenseHandles.end())
+        {
+            g_dualsenseHandles.erase(it);
+            wasDualsense = true;
+        }
+    }
+    if (wasDualsense)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_pendingMutex);
+            for (auto it = g_pendingReads.begin(); it != g_pendingReads.end(); )
+                it = (it->second.handle == hObject) ? g_pendingReads.erase(it) : std::next(it);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_injectMutex);
+            g_injectFramesByHandle.erase(hObject);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
+            g_readFileLoggedHandles.erase(hObject);
+            g_gorLoggedHandles.erase(hObject);
+        }
+    }
+    return CloseHandle_Original(hObject);
 }
 
 static void hookAllInput()
@@ -640,6 +716,17 @@ static void hookAllInput()
             _LOG("[Hook] GetOverlappedResult hooked (%s)", kernelbase ? "kernelbase" : "kernel32");
         else
             _LOG("[Hook] GetOverlappedResult hook FAILED");
+    }
+
+    // 5. CloseHandle — prune stale DualSense handle entries on close
+    auto fnClose = GetProcAddress(kernel32, "CloseHandle");
+    if (fnClose) {
+        if (MH_CreateHook(fnClose, CloseHandle_Hook,
+                reinterpret_cast<LPVOID*>(&CloseHandle_Original)) == MH_OK &&
+            MH_EnableHook(fnClose) == MH_OK)
+            _LOG("[Hook] CloseHandle hooked");
+        else
+            _LOG("[Hook] CloseHandle hook FAILED");
     }
 }
 
