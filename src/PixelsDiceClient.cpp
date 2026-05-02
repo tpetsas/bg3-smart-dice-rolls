@@ -17,6 +17,7 @@
 #include <vector>
 #include <windows.h>
 #include <tlhelp32.h>
+#include <Xinput.h>
 #include "minhook/include/MinHook.h"
 
 // shared state (defined in SmartDiceRolls.cpp)
@@ -56,10 +57,10 @@ static std::string jsonStringValue(const std::string& json, const std::string& k
     return json.substr(pos + 1, end - pos - 1);
 }
 
-// forward declaration — defined later in the hook section; used by connectPipe()
-// so the pipe open bypasses our CreateFileW hook.
+// forward declarations
 using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static CreateFileW_t CreateFileW_Original;
+static HWND findBG3Window();
 
 static int jsonIntValue(const std::string& json, const std::string& key, int def = 0)
 {
@@ -286,8 +287,29 @@ using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT hRawInput, UINT uiCommand,
     LPVOID pData, PUINT pcbSize, UINT cbSizeHeader);
 static GetRawInputData_t GetRawInputData_Original = nullptr;
 
-static std::atomic<bool> g_hasHidController{false};  // true once we see DualSense input
+static std::atomic<bool> g_hasHidController{false};  // true once we see any supported controller
 static HANDLE g_dualsenseDevice = nullptr;             // cached RawInput device handle (diagnostic only)
+
+// Xbox device handle tracking — a set rather than a single handle because the kernel
+// can present a different HANDLE value for the same physical device across resets
+// (e.g. when BG3 re-registers raw input during UI transitions).
+static std::mutex                 g_xboxDevicesMutex;
+static std::unordered_set<HANDLE> g_xboxRawDevices;   // confirmed Xbox device handles
+static std::unordered_set<HANDLE> g_checkedDevices;   // handles already classified (avoid repeat syscalls)
+static std::atomic<bool>          g_hasXboxDevice{false};
+static HANDLE                     g_lastXboxDevice = nullptr; // first discovered Xbox handle (for synthetic reports)
+
+// Sentinel HRAWINPUT for synthetic Xbox Y-press injection.
+// Value is non-aligned (LSB set) so it can never be a real kernel pointer.
+#define FAKE_XBOX_HINPUT ((HRAWINPUT)0xCAFEBABE1337)
+
+// Neutral-stick Xbox HID report (16 bytes) with Y button pressed (byte[11] = 0x08).
+// Layout: [0]=header, [1-2]=LX, [3-4]=LY, [5-6]=RX, [7-8]=RY,
+//         [9]=LT, [10]=status(0x80), [11]=face buttons, [12-15]=other.
+static const BYTE kSyntheticXboxYReport[16] = {
+    0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00,
+    0x80, 0x00, 0x80, 0x08, 0x00, 0x00, 0x00, 0x00
+};
 
 // Time-based injection window — inject into ALL reads until the deadline passes.
 // Multiple handles (Steam + SDL) may read concurrently; a frame counter would be
@@ -356,21 +378,92 @@ static bool isDualSenseDevice(HANDLE hDevice)
     for (auto& ch : deviceName) ch = towlower(ch);
 
     // DualSense VID=054C PID=0CE6, DualSense Edge VID=054C PID=0DF2
-    bool isDualSense = (deviceName.find(L"vid_054c") != std::wstring::npos) &&
-                       (deviceName.find(L"pid_0ce6") != std::wstring::npos ||
-                        deviceName.find(L"pid_0df2") != std::wstring::npos);
+    return (deviceName.find(L"vid_054c") != std::wstring::npos) &&
+           (deviceName.find(L"pid_0ce6") != std::wstring::npos ||
+            deviceName.find(L"pid_0df2") != std::wstring::npos);
+}
 
-    // Log device info for diagnostics
-    char narrowName[512] = {};
-    WideCharToMultiByte(CP_UTF8, 0, deviceName.c_str(), -1, narrowName, sizeof(narrowName), nullptr, nullptr);
-    _LOG("[RawInput] HID device: %s → %s", narrowName, isDualSense ? "DUALSENSE" : "other");
+// Check if a raw input device is an Xbox controller (Microsoft VID 045E)
+static bool isXboxDevice(HANDLE hDevice)
+{
+    UINT nameSize = 0;
+    if (GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, nullptr, &nameSize) != 0)
+        return false;
+    std::wstring name(nameSize, L'\0');
+    if (GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, &name[0], &nameSize) == (UINT)-1)
+        return false;
+    for (auto& ch : name) ch = towlower(ch);
+    return name.find(L"vid_045e") != std::wstring::npos;
+}
 
-    return isDualSense;
+// Classify dev on first sight; return true if it is an Xbox device.
+// Subsequent calls for the same handle are O(1) — no repeated system calls.
+static bool isXboxRawDevice(HANDLE dev)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_xboxDevicesMutex);
+        if (g_xboxRawDevices.count(dev)) return true;
+        if (g_checkedDevices.count(dev)) return false;
+        g_checkedDevices.insert(dev);
+    }
+    if (isXboxDevice(dev))
+    {
+        _LOG("[RawInput] Xbox device discovered (handle=%p) — Y injection available", dev);
+        g_hasHidController.store(true, std::memory_order_relaxed);
+        g_hasXboxDevice.store(true, std::memory_order_relaxed);
+        g_lastXboxDevice = dev;
+        std::lock_guard<std::mutex> lk(g_xboxDevicesMutex);
+        g_xboxRawDevices.insert(dev);
+        return true;
+    }
+    return false;
 }
 
 static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
     LPVOID pData, PUINT pcbSize, UINT cbSizeHeader)
 {
+    // Handle synthetic Xbox Y-press: we posted WM_INPUT with FAKE_XBOX_HINPUT so this hook
+    // fires even when the controller is idle (no real WM_INPUT would have arrived otherwise).
+    if (hRawInput == FAKE_XBOX_HINPUT)
+    {
+        constexpr UINT kReportBytes = sizeof(kSyntheticXboxYReport);
+        UINT fullSize = cbSizeHeader + sizeof(DWORD) + sizeof(DWORD) + kReportBytes;
+
+        if (uiCommand == RID_HEADER)
+        {
+            // Caller querying just the header (some SDKs do this before the full read)
+            if (!pData) { *pcbSize = cbSizeHeader; return 0; }
+            if (*pcbSize < cbSizeHeader) { *pcbSize = cbSizeHeader; SetLastError(ERROR_INSUFFICIENT_BUFFER); return (UINT)-1; }
+            RAWINPUTHEADER* hdr = reinterpret_cast<RAWINPUTHEADER*>(pData);
+            hdr->dwType  = RIM_TYPEHID;
+            hdr->dwSize  = fullSize;
+            hdr->hDevice = g_lastXboxDevice;
+            hdr->wParam  = RIM_INPUT;
+            *pcbSize = cbSizeHeader;
+            return cbSizeHeader;
+        }
+
+        if (uiCommand == RID_INPUT)
+        {
+            if (!pData) { *pcbSize = fullSize; return 0; }
+            if (*pcbSize < fullSize) { *pcbSize = fullSize; SetLastError(ERROR_INSUFFICIENT_BUFFER); return (UINT)-1; }
+            RAWINPUT* ri = reinterpret_cast<RAWINPUT*>(pData);
+            ZeroMemory(ri, fullSize);
+            ri->header.dwType       = RIM_TYPEHID;
+            ri->header.dwSize       = fullSize;
+            ri->header.hDevice      = g_lastXboxDevice;
+            ri->header.wParam       = RIM_INPUT;
+            ri->data.hid.dwSizeHid  = kReportBytes;
+            ri->data.hid.dwCount    = 1;
+            memcpy(ri->data.hid.bRawData, kSyntheticXboxYReport, kReportBytes);
+            *pcbSize = fullSize;
+            _LOG("[RawInput] Synthetic Xbox Y report served (size=%u)", fullSize);
+            return fullSize;
+        }
+
+        // Unknown command — let the original handle it (will fail, that's fine)
+    }
+
     UINT result = GetRawInputData_Original(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
 
     if (pData && uiCommand == RID_INPUT && result != (UINT)-1)
@@ -388,23 +481,30 @@ static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
                 {
                     g_dualsenseDevice = raw->header.hDevice;
                     g_hasHidController.store(true, std::memory_order_relaxed);
-                    _LOG("[RawInput] DualSense detected — triangle injection available (handle=%p)",
-                        raw->header.hDevice);
-
-                    // Dump first report for verification
-                    BYTE* reportData = raw->data.hid.bRawData;
-                    char hex[256] = {};
-                    int pos = 0;
-                    UINT sz = raw->data.hid.dwSizeHid;
-                    for (UINT i = 0; i < sz && i < 20 && pos < 250; i++)
-                        pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", reportData[i]);
-                    _LOG("[RawInput] Report (size=%u): %s", sz, hex);
+                    _LOG("[RawInput] DualSense detected (handle=%p)", raw->header.hDevice);
                 }
             }
 
-            // NOTE: injection via GetRawInputData doesn't affect SDL's input.
-            // SDL reads DualSense via hidapi (ReadFile). Injection is done
-            // in ReadFile_Hook / GetOverlappedResult_Hook instead.
+            // DualSense: injection happens in ReadFile_Hook / GetOverlappedResult_Hook
+            // because SDL reads it via hidapi, not raw input.
+
+            // Xbox: BG3 reads the XInput ig_00 HID interface via GetRawInputData.
+            // Face buttons are in byte[11]: A=0x01, B=0x02, X=0x04, Y=0x08.
+            HANDLE dev = raw->header.hDevice;
+            if (isXboxRawDevice(dev))
+            {
+                BYTE* rd = raw->data.hid.bRawData;
+                UINT  sz = raw->data.hid.dwSizeHid;
+
+                ULONGLONG now      = GetTickCount64();
+                ULONGLONG deadline = g_injectUntilTick.load(std::memory_order_relaxed);
+                if (now < deadline && sz >= 12)
+                {
+                    rd[11] |= 0x08;  // Y button: byte 11, bit 3
+                    if (!g_injectLogged.exchange(true, std::memory_order_relaxed))
+                        _LOG("[RawInput] Xbox Y injected (handle=%p)", dev);
+                }
+            }
         }
     }
 
@@ -421,11 +521,14 @@ using CreateFileA_t        = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_AT
 using ReadFile_t            = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 using GetOverlappedResult_t = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
 using CloseHandle_t         = BOOL(WINAPI*)(HANDLE);
+using XInputGetState_t      = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 
-static CreateFileA_t        CreateFileA_Original        = nullptr;
-static ReadFile_t            ReadFile_Original           = nullptr;
+static CreateFileA_t        CreateFileA_Original         = nullptr;
+static ReadFile_t            ReadFile_Original            = nullptr;
 static GetOverlappedResult_t GetOverlappedResult_Original = nullptr;
-static CloseHandle_t         CloseHandle_Original        = nullptr;
+static CloseHandle_t         CloseHandle_Original         = nullptr;
+static XInputGetState_t      XInputGetState_Original      = nullptr;
+static std::atomic<DWORD>    g_xInputFakePacket{0x40000000}; // injection-window packet counter
 
 // SDL opens the DualSense multiple times — track all handles
 static std::mutex g_dsHandlesMutex;
@@ -452,6 +555,47 @@ static void requestTrianglePress()
     g_injectLogged.store(false, std::memory_order_relaxed);
     g_injectUntilTick.store(deadline, std::memory_order_relaxed);
     _LOG("[RawInput] Triangle press requested (%llums window)", kInjectWindowMs);
+
+    // Xbox: BG3 reads controller input via GetRawInputData (WM_INPUT path), not XInput.
+    // If the stick is idle when injection opens, no real WM_INPUT arrives → hook never fires.
+    // Fix: post a synthetic WM_INPUT. We first query which HWND BG3 registered for raw input
+    // (usually a hidden SDL background window, not the visible game window), then post there.
+    if (g_hasXboxDevice.load(std::memory_order_relaxed))
+    {
+        // Find every registered raw-input target and log / post to all HID ones.
+        UINT numDevices = 0;
+        GetRegisteredRawInputDevices(nullptr, &numDevices, sizeof(RAWINPUTDEVICE));
+        if (numDevices > 0)
+        {
+            std::vector<RAWINPUTDEVICE> rids(numDevices);
+            UINT got = GetRegisteredRawInputDevices(rids.data(), &numDevices, sizeof(RAWINPUTDEVICE));
+            if (got != (UINT)-1)
+            {
+                for (auto& rid : rids)
+                {
+                    // Post to every registered HID window (usUsagePage 1 = Generic Desktop)
+                    HWND target = rid.hwndTarget;
+                    if (!target) target = findBG3Window(); // null hwndTarget → follows focus
+                    if (target && rid.usUsagePage == 0x01)
+                    {
+                        PostMessageW(target, WM_INPUT, MAKEWPARAM(RIM_INPUT, 0), (LPARAM)FAKE_XBOX_HINPUT);
+                        _LOG("[RawInput] Posted synthetic WM_INPUT (Xbox Y) to hwnd=%p (usage=0x%X)",
+                            target, rid.usUsage);
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Fallback: post to the visible game window
+            HWND hwnd = findBG3Window();
+            if (hwnd)
+            {
+                PostMessageW(hwnd, WM_INPUT, MAKEWPARAM(RIM_INPUT, 0), (LPARAM)FAKE_XBOX_HINPUT);
+                _LOG("[RawInput] Posted synthetic WM_INPUT (Xbox Y) to game window %p (fallback)", hwnd);
+            }
+        }
+    }
 }
 
 static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
@@ -475,8 +619,6 @@ static HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess,
                 g_dualsenseHandles.push_back(result);
             }
             g_hasHidController.store(true, std::memory_order_relaxed);
-
-            // No per-open logging in release — handles are transient (enumeration only)
         }
     }
 
@@ -504,7 +646,6 @@ static HANDLE WINAPI CreateFileA_Hook(LPCSTR lpFileName, DWORD dwDesiredAccess,
                 g_dualsenseHandles.push_back(result);
             }
             g_hasHidController.store(true, std::memory_order_relaxed);
-            // No per-open logging in release — handles are transient (enumeration only)
         }
     }
 
@@ -544,19 +685,10 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
         if (buttonByte >= 0)
         {
             g_hasHidController.store(true, std::memory_order_relaxed);
-            bool firstForHandle = false;
             {
                 std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
-                firstForHandle = g_readFileLoggedHandles.insert(hFile).second;
-            }
-            if (firstForHandle)
-            {
-                char hex[64] = {};
-                int pos = 0;
-                for (int i = 0; i < 10 && pos < 60; i++)
-                    pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
-                _LOG("[HID] DualSense %s read (sync, %u bytes): handle=%p data=%s",
-                    conn, bytes, hFile, hex);
+                if (g_readFileLoggedHandles.insert(hFile).second)
+                    _LOG("[HID] DualSense %s handle=%p (sync)", conn, hFile);
             }
 
             // Inject on sync path too — SDL may use sync reads for BT
@@ -567,26 +699,15 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
                 buf[buttonByte] |= kTriangleButtonMask;
                 if (buf[0] == 0x31) fixBtFullCrc(buf, bytes);  // BT Full has CRC32
                 if (!g_injectLogged.exchange(true, std::memory_order_relaxed))
-                    _LOG("[HID] Triangle injected (%s, handle=%p, byte[%d]: 0x%02X)",
-                        conn, hFile, buttonByte, buf[buttonByte]);
+                    _LOG("[HID] Triangle injected (%s, handle=%p)", conn, hFile);
             }
         }
     }
     else if (lpOverlapped && savedErr == ERROR_IO_PENDING)
     {
         // Async — record buffer keyed by OVERLAPPED* for GetOverlappedResult to find
-        {
-            std::lock_guard<std::mutex> lock(g_pendingMutex);
-            g_pendingReads[lpOverlapped] = PendingRead{ lpBuffer, hFile };
-        }
-        bool firstForHandle = false;
-        {
-            std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
-            firstForHandle = g_readFileLoggedHandles.insert(hFile).second;
-        }
-        if (firstForHandle)
-            _LOG("[HID] %u-byte overlapped read pending: handle=%p ol=%p",
-                nNumberOfBytesToRead, hFile, lpOverlapped);
+        std::lock_guard<std::mutex> lock(g_pendingMutex);
+        g_pendingReads[lpOverlapped] = PendingRead{ lpBuffer, hFile };
     }
 
     SetLastError(savedErr);
@@ -636,20 +757,10 @@ static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlap
         {
             g_hasHidController.store(true, std::memory_order_relaxed);
 
-            // Log first async completion per handle
-            bool firstForHandle = false;
             {
                 std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
-                firstForHandle = g_gorLoggedHandles.insert(pending.handle).second;
-            }
-            if (firstForHandle)
-            {
-                char hex[64] = {};
-                int pos = 0;
-                for (int i = 0; i < 10 && pos < 60; i++)
-                    pos += sprintf_s(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
-                _LOG("[HID] Async DualSense %s read completed: handle=%p bytes=%u data=%s",
-                    conn, pending.handle, bytes, hex);
+                if (g_gorLoggedHandles.insert(pending.handle).second)
+                    _LOG("[HID] DualSense %s handle=%p (async)", conn, pending.handle);
             }
 
             // Inject triangle during the active time window
@@ -696,6 +807,30 @@ static BOOL WINAPI CloseHandle_Hook(HANDLE hObject)
         }
     }
     return CloseHandle_Original(hObject);
+}
+
+static DWORD WINAPI XInputGetState_Hook(DWORD dwUserIndex, XINPUT_STATE* pState)
+{
+    DWORD result = XInputGetState_Original(dwUserIndex, pState);
+    if (result == ERROR_SUCCESS && pState)
+    {
+        if (!g_hasHidController.load(std::memory_order_relaxed))
+        {
+            g_hasHidController.store(true, std::memory_order_relaxed);
+            _LOG("[XInput] Xbox controller detected (user index %lu) — Y injection available", dwUserIndex);
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now < g_injectUntilTick.load(std::memory_order_relaxed))
+        {
+            pState->Gamepad.wButtons |= XINPUT_GAMEPAD_Y;
+            // SDL skips button processing when dwPacketNumber is unchanged (idle controller).
+            // Bump it each call so SDL sees a new state and reads the injected buttons.
+            pState->dwPacketNumber = g_xInputFakePacket.fetch_add(1, std::memory_order_relaxed);
+            if (!g_injectLogged.exchange(true, std::memory_order_relaxed))
+                _LOG("[XInput] Y injected (user index %lu)", dwUserIndex);
+        }
+    }
+    return result;
 }
 
 static void hookAllInput()
@@ -770,6 +905,27 @@ static void hookAllInput()
             _LOG("[Hook] CloseHandle hooked");
         else
             _LOG("[Hook] CloseHandle hook FAILED");
+    }
+
+    // 6. XInputGetState — Xbox controller (USB + Wireless, both covered by XInput).
+    // Must load the real system DLL explicitly: GetModuleHandleA("xinput1_4.dll") would
+    // return o-negative's proxy, not the real implementation.
+    {
+        char sysDir[MAX_PATH];
+        GetSystemDirectoryA(sysDir, MAX_PATH);
+        std::string realXInputPath = std::string(sysDir) + "\\xinput1_4.dll";
+        HMODULE hRealXInput = LoadLibraryA(realXInputPath.c_str());
+        FARPROC fnXInput = hRealXInput ? GetProcAddress(hRealXInput, "XInputGetState") : nullptr;
+        if (fnXInput) {
+            if (MH_CreateHook(fnXInput, XInputGetState_Hook,
+                    reinterpret_cast<LPVOID*>(&XInputGetState_Original)) == MH_OK &&
+                MH_EnableHook(fnXInput) == MH_OK)
+                _LOG("[Hook] XInputGetState hooked (real xinput1_4.dll)");
+            else
+                _LOG("[Hook] XInputGetState hook FAILED");
+        } else {
+            _LOG("[Hook] XInputGetState: could not load real xinput1_4.dll from %s", sysDir);
+        }
     }
 }
 

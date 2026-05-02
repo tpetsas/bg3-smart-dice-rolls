@@ -121,13 +121,14 @@ begin
   Memo.Text :=
 'This mod is provided "as is" with no warranty or guarantee of performance.' + #13#10 +
 'By continuing, you acknowledge that you are installing third-party software' + #13#10 +
-'which may modify or interact with the game in ways not intended by its original developers.' + #13#10 +
+'which may modify or interact with the game in ways not intended by its' + #13#10 +
+'original developers.' + #13#10 +
 '' + #13#10 +
-'Use at your own risk. The authors and platforms are not responsible' + #13#10 +
-'for any damage, data loss, or other issues caused by this software.' + #13#10 +
+'Use at your own risk. The authors and platforms are not responsible for any' + #13#10 +
+'damage, data loss, or other issues caused by this software.' + #13#10 +
 '' + #13#10 +
-'This is a non-commercial fan-made project. All rights to the game "Baldur''s Gate 3"' + #13#10 +
-'and its characters belong to Larian Studios.' + #13#10 +
+'This is a non-commercial fan-made project. All rights to the game' + #13#10 +
+'"Baldur''s Gate 3" and its characters belong to Larian Studios.' + #13#10 +
 '' + #13#10 +
 'Created by Thanos Petsas - https://thanasispetsas.com';
 
