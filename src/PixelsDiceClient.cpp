@@ -114,9 +114,12 @@ static bool launchTray()
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
+    wchar_t cmdLine[64];
+    swprintf_s(cmdLine, L"PixelsTray.exe --spawner-pid=%lu", GetCurrentProcessId());
+
     PROCESS_INFORMATION pi = {};
     BOOL ok = CreateProcessW(
-        fullPath, nullptr, nullptr, nullptr,
+        fullPath, cmdLine, nullptr, nullptr,
         FALSE,  // do NOT inherit handles
         DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP,
         nullptr, nullptr, &si, &pi);
