@@ -6,6 +6,7 @@
 #include "PixelsDiceClient.h"
 #include "SmartDiceResult.h"
 #include "Logger.h"
+#include "Config.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -13,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <cmath>
 #include <unordered_set>
 #include <vector>
 #include <windows.h>
@@ -23,6 +25,7 @@
 // shared state (defined in SmartDiceRolls.cpp)
 extern std::mutex g_dialogueRollMutex;
 extern SmartDiceResult g_smartDiceResult;
+extern Config g_config;
 
 static constexpr const wchar_t* kPipeName = L"\\\\.\\pipe\\PixelsDiceRoll";
 static constexpr int kMaxConnectAttempts = 5;
@@ -264,11 +267,60 @@ static bool requestRoll(const char* mode, uint32_t generation, SmartDiceResult& 
     return true;
 }
 
-static void sendReady()
+#define FAKE_MOUSE_DOWN_HINPUT ((HRAWINPUT)0xFEEDFACE1111)
+#define FAKE_MOUSE_UP_HINPUT   ((HRAWINPUT)0xFEEDFACE2222)
+
+static void requestMouseClick()
 {
-    std::string response;
-    sendAndReceive("{\"mode\": \"ready\"}", response);
-    _LOG("[PipeClient] Ready response: %s", response.c_str());
+    std::thread([]
+    {
+        HWND hw = findBG3Window();
+        if (!hw) return;
+
+        RECT rc{};
+        if (!GetClientRect(hw, &rc)) return;
+
+        // Client-space coordinates for WM_LBUTTONDOWN lParam
+        LONG cx = static_cast<LONG>(std::lround((rc.right - rc.left) * g_config.mouseClickNormX));
+        LONG cy = static_cast<LONG>(std::lround((rc.bottom - rc.top) * g_config.mouseClickNormY));
+
+        // Screen-space coordinates for SendInput cursor move
+        POINT screenPt{cx, cy};
+        if (!ClientToScreen(hw, &screenPt)) return;
+
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        if (sw <= 0 || sh <= 0) return;
+        LONG ax = static_cast<LONG>(std::lround(screenPt.x * 65535.0 / (sw - 1)));
+        LONG ay = static_cast<LONG>(std::lround(screenPt.y * 65535.0 / (sh - 1)));
+
+        // Focus and move cursor so BG3 registers the hover.
+        SetForegroundWindow(hw);
+        Sleep(100);
+        INPUT move{};
+        move.type = INPUT_MOUSE;
+        move.mi.dx = ax; move.mi.dy = ay;
+        move.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        SendInput(1, &move, sizeof(INPUT));
+        Sleep(200);
+
+        // Re-focus, then loop-inject over a 400ms window — same idea as Xbox injection:
+        // keep firing until BG3's message loop picks it up on the right frame.
+        SetForegroundWindow(hw);
+        Sleep(50);
+
+        ULONGLONG deadline = GetTickCount64() + 400;
+        int clicks = 0;
+        while (GetTickCount64() < deadline)
+        {
+            PostMessageW(hw, WM_INPUT, MAKEWPARAM(RIM_INPUT, 0), (LPARAM)FAKE_MOUSE_DOWN_HINPUT);
+            Sleep(50);
+            PostMessageW(hw, WM_INPUT, MAKEWPARAM(RIM_INPUT, 0), (LPARAM)FAKE_MOUSE_UP_HINPUT);
+            Sleep(60);
+            clicks++;
+        }
+        _LOG("[Mouse] Injected %d raw clicks to hwnd=%p (client %ld,%ld)", clicks, hw, cx, cy);
+    }).detach();
 }
 
 // ── GetRawInputData hook — triangle injection for DualSense controller ──
@@ -462,6 +514,39 @@ static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
         }
 
         // Unknown command — let the original handle it (will fail, that's fine)
+    }
+
+    // Synthetic raw mouse left-click (no-controller fallback).
+    if (hRawInput == FAKE_MOUSE_DOWN_HINPUT || hRawInput == FAKE_MOUSE_UP_HINPUT)
+    {
+        UINT fullSize = cbSizeHeader + sizeof(RAWMOUSE);
+        bool isDown   = (hRawInput == FAKE_MOUSE_DOWN_HINPUT);
+
+        if (uiCommand == RID_HEADER)
+        {
+            if (!pData) { *pcbSize = cbSizeHeader; return 0; }
+            if (*pcbSize < cbSizeHeader) { *pcbSize = cbSizeHeader; SetLastError(ERROR_INSUFFICIENT_BUFFER); return (UINT)-1; }
+            RAWINPUTHEADER* hdr = reinterpret_cast<RAWINPUTHEADER*>(pData);
+            hdr->dwType = RIM_TYPEMOUSE; hdr->dwSize = fullSize;
+            hdr->hDevice = nullptr;      hdr->wParam  = RIM_INPUT;
+            *pcbSize = cbSizeHeader; return cbSizeHeader;
+        }
+
+        if (uiCommand == RID_INPUT)
+        {
+            if (!pData) { *pcbSize = fullSize; return 0; }
+            if (*pcbSize < fullSize) { *pcbSize = fullSize; SetLastError(ERROR_INSUFFICIENT_BUFFER); return (UINT)-1; }
+            RAWINPUT* ri = reinterpret_cast<RAWINPUT*>(pData);
+            ZeroMemory(ri, fullSize);
+            ri->header.dwType    = RIM_TYPEMOUSE;
+            ri->header.dwSize    = fullSize;
+            ri->header.hDevice   = nullptr;
+            ri->header.wParam    = RIM_INPUT;
+            ri->data.mouse.usButtonFlags = isDown ? RI_MOUSE_LEFT_BUTTON_DOWN : RI_MOUSE_LEFT_BUTTON_UP;
+            *pcbSize = fullSize;
+            _LOG("[RawInput] Synthetic mouse %s injected", isDown ? "LEFT_DOWN" : "LEFT_UP");
+            return fullSize;
+        }
     }
 
     UINT result = GetRawInputData_Original(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
@@ -989,8 +1074,8 @@ static void pipeListenerThread()
                 }
                 else
                 {
-                    _LOG("[PipeClient] No controller — using mouse click via tray app");
-                    sendReady();
+                    _LOG("[PipeClient] No controller — using mouse click");
+                    requestMouseClick();
                 }
             }
             // else: server returned an error (e.g. timeout) — pipe is fine, just skip

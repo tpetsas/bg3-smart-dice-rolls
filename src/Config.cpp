@@ -28,10 +28,17 @@ Config::Config (const char *iniPath) {
     }
 
     memset(value, 0, sizeof(value));
+    GetPrivateProfileStringA("mouse", "click_norm_x", "0.50", value, sizeof(value), iniPath);
+    mouseClickNormX = static_cast<float>(atof(value));
+
+    memset(value, 0, sizeof(value));
+    GetPrivateProfileStringA("mouse", "click_norm_y", "0.50", value, sizeof(value), iniPath);
+    mouseClickNormY = static_cast<float>(atof(value));
 }
 
 void Config::print() {
-    _LOG("Config: [debug mode: %s]",
-        isDebugMode ? "true" : "false"
+    _LOG("Config: [debug mode: %s, mouse click: (%.2f, %.2f)]",
+        isDebugMode ? "true" : "false",
+        mouseClickNormX, mouseClickNormY
     );
 }
