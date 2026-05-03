@@ -289,10 +289,9 @@ static GetRawInputData_t GetRawInputData_Original = nullptr;
 static std::atomic<bool> g_hasHidController{false};  // true once we see DualSense input
 static HANDLE g_dualsenseDevice = nullptr;             // cached RawInput device handle (diagnostic only)
 
-// Per-handle injection counter — each tracked DualSense file handle gets its own frame budget
-// so a triangle press lands on every controller, not just whichever completes its read first.
-static std::mutex                      g_injectMutex;
-static std::unordered_map<HANDLE, int> g_injectFramesByHandle;
+// Global injection counter — set by requestTrianglePress(), consumed by GetOverlappedResult_Hook.
+// We use a global counter because the actual reading handles may predate our CreateFile hooks.
+static std::atomic<int> g_injectFrames{0};
 
 static constexpr int  kTrianglePressReports = 3;   // ~12ms at 250Hz — quick tap, avoids fast-forward
 static constexpr int  kTriangleButtonByte   = 8;   // offset in HID report (byte 8 = dpad + face buttons)
@@ -370,6 +369,8 @@ static UINT WINAPI GetRawInputData_Hook(HRAWINPUT hRawInput, UINT uiCommand,
 }
 
 static std::atomic<int> g_readFile64Count{0};  // count 64-byte reads for diagnostics
+static std::atomic<int> g_totalReadFileCalls{0}; // count ALL ReadFile calls
+static std::atomic<int> g_dsReadFileCalls{0};    // count ReadFile calls on tracked DS handles
 
 // ── HID file hooks — intercept SDL's hidapi reads from the DualSense ──
 //
@@ -408,18 +409,11 @@ static std::unordered_map<LPOVERLAPPED, PendingRead> g_pendingReads;
 
 static void requestTrianglePress()
 {
-    std::vector<HANDLE> handlesSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
-        handlesSnapshot = g_dualsenseHandles;
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_injectMutex);
-        for (HANDLE h : handlesSnapshot)
-            g_injectFramesByHandle[h] = kTrianglePressReports;
-    }
-    _LOG("[RawInput] Triangle press requested (%d reports x %zu handles), 64-byte reads so far: %d",
-        kTrianglePressReports, handlesSnapshot.size(),
+    g_injectFrames.store(kTrianglePressReports, std::memory_order_relaxed);
+    _LOG("[RawInput] Triangle press requested (%d reports), reads: total=%d ds=%d 64b=%d",
+        kTrianglePressReports,
+        g_totalReadFileCalls.load(std::memory_order_relaxed),
+        g_dsReadFileCalls.load(std::memory_order_relaxed),
         g_readFile64Count.load(std::memory_order_relaxed));
 }
 
@@ -493,8 +487,19 @@ static BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfB
                                        lpNumberOfBytesRead, lpOverlapped);
     DWORD savedErr = GetLastError();
 
-    // Fast path: only care about 64-byte reads on a tracked DualSense handle
-    if (nNumberOfBytesToRead != 64 || !lpBuffer || !isDualsenseHandle(hFile))
+    g_totalReadFileCalls.fetch_add(1, std::memory_order_relaxed);
+
+    // Diagnostic: log ANY ReadFile on a tracked DualSense handle (regardless of size)
+    if (lpBuffer && isDualsenseHandle(hFile))
+    {
+        int dsCount = g_dsReadFileCalls.fetch_add(1, std::memory_order_relaxed);
+        if (dsCount < 5)  // log first 5
+            _LOG("[HID] ReadFile on DS handle=%p size=%u overlapped=%s result=%d err=%u",
+                hFile, nNumberOfBytesToRead, lpOverlapped ? "yes" : "no", result, savedErr);
+    }
+
+    // Only process 64-byte reads (DualSense USB HID report size)
+    if (nNumberOfBytesToRead != 64 || !lpBuffer)
     {
         SetLastError(savedErr);
         return result;
@@ -594,27 +599,19 @@ static BOOL WINAPI GetOverlappedResult_Hook(HANDLE hFile, LPOVERLAPPED lpOverlap
                     pending.handle, bytes, hex);
             }
 
-            // Consume this handle's per-handle injection budget
-            bool injected = false;
-            int  remaining = 0;
+            // Consume global injection budget
+            if (g_injectFrames.load(std::memory_order_relaxed) > 0)
             {
-                std::lock_guard<std::mutex> lock(g_injectMutex);
-                auto it = g_injectFramesByHandle.find(pending.handle);
-                if (it != g_injectFramesByHandle.end() && it->second > 0)
+                int remaining = g_injectFrames.fetch_sub(1, std::memory_order_relaxed);
+                if (remaining > 0)
                 {
-                    remaining = it->second--;
-                    if (it->second == 0) g_injectFramesByHandle.erase(it);
-                    injected = true;
+                    buf[kTriangleButtonByte] |= kTriangleButtonMask;
+                    if (remaining == kTrianglePressReports)
+                        _LOG("[HID] Triangle injection STARTED (handle=%p, byte[%d]: 0x%02X)",
+                            pending.handle, kTriangleButtonByte, buf[kTriangleButtonByte]);
+                    if (remaining == 1)
+                        _LOG("[HID] Triangle injection ENDED (handle=%p)", pending.handle);
                 }
-            }
-            if (injected)
-            {
-                buf[kTriangleButtonByte] |= kTriangleButtonMask;
-                if (remaining == kTrianglePressReports)
-                    _LOG("[HID] Triangle injection STARTED (handle=%p, byte[%d]: 0x%02X)",
-                        pending.handle, kTriangleButtonByte, buf[kTriangleButtonByte]);
-                if (remaining == 1)
-                    _LOG("[HID] Triangle injection ENDED (handle=%p)", pending.handle);
             }
         }
     }
@@ -637,14 +634,16 @@ static BOOL WINAPI CloseHandle_Hook(HANDLE hObject)
     }
     if (wasDualsense)
     {
+        size_t remaining = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_dsHandlesMutex);
+            remaining = g_dualsenseHandles.size();
+        }
+        _LOG("[HID] DualSense handle closed: handle=%p remaining=%zu", hObject, remaining);
         {
             std::lock_guard<std::mutex> lock(g_pendingMutex);
             for (auto it = g_pendingReads.begin(); it != g_pendingReads.end(); )
                 it = (it->second.handle == hObject) ? g_pendingReads.erase(it) : std::next(it);
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_injectMutex);
-            g_injectFramesByHandle.erase(hObject);
         }
         {
             std::lock_guard<std::mutex> lock(g_loggedHandlesMutex);
