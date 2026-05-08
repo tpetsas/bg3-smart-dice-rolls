@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <Xinput.h>
+#include <cmath>
 #include "minhook/include/MinHook.h"
 
 // shared state (defined in SmartDiceRolls.cpp)
@@ -267,11 +268,50 @@ static bool requestRoll(const char* mode, uint32_t generation, SmartDiceResult& 
     return true;
 }
 
-static void sendReady()
+static void moveMouseRaw(int screenX, int screenY)
 {
-    std::string response;
-    sendAndReceive("{\"mode\": \"ready\"}", response);
-    _LOG("[PipeClient] Ready response: %s", response.c_str());
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw <= 0 || sh <= 0) return;
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = static_cast<LONG>(std::lround(screenX * 65535.0 / (sw - 1)));
+    input.mi.dy = static_cast<LONG>(std::lround(screenY * 65535.0 / (sh - 1)));
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static bool clientPointToScreen(HWND hwnd, float normX, float normY, POINT& outPt)
+{
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc)) return false;
+    outPt.x = static_cast<LONG>(std::lround((rc.right - rc.left) * normX));
+    outPt.y = static_cast<LONG>(std::lround((rc.bottom - rc.top) * normY));
+    return ClientToScreen(hwnd, &outPt) != FALSE;
+}
+
+static void clickDiceButton(const std::string& rollMode)
+{
+    HWND hwnd = findBG3Window();
+    if (!hwnd) { _LOG("[PipeClient] clickDiceButton: BG3 window not found"); return; }
+
+    const bool multiDie = (rollMode == "advantage" || rollMode == "disadvantage");
+    const float normX = multiDie ? 0.47f : 0.50f;
+    const float normY = 0.43f;
+
+    POINT pt{};
+    if (!clientPointToScreen(hwnd, normX, normY, pt)) return;
+
+    // Raw-input move triggers BG3's controller→mouse mode switch.
+    // No SetForegroundWindow needed — we're already inside the BG3 process.
+    moveMouseRaw(pt.x, pt.y);
+    Sleep(100);
+    INPUT clicks[2] = {};
+    clicks[0].type = INPUT_MOUSE; clicks[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    clicks[1].type = INPUT_MOUSE; clicks[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, clicks, sizeof(INPUT));
+    _LOG("[PipeClient] Clicked dice button (rollMode=%s normX=%.2f)", rollMode.c_str(), normX);
 }
 
 // ── GetRawInputData hook — triangle injection for DualSense controller ──
@@ -992,8 +1032,8 @@ static void pipeListenerThread()
                 }
                 else
                 {
-                    _LOG("[PipeClient] No controller — using mouse click via tray app");
-                    sendReady();
+                    _LOG("[PipeClient] No controller — clicking dice button directly");
+                    clickDiceButton(mode);
                 }
             }
             // else: server returned an error (e.g. timeout) — pipe is fine, just skip
