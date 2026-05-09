@@ -11,7 +11,9 @@ Built with the tools and technologies:
 [![Pixels](https://tinyurl.com/24wx9m6a)](https://gamewithpixels.com/)
 [![Ghidra](https://tinyurl.com/yuv64wyh)](https://ghidra-sre.org/)
 
+<p align="center">
 <img width="512" alt="logo" src="installer/assets/smart_dice_rolls_icon_master_clean_1024.png" />
+</p>
 
 ## Overview
 
