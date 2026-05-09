@@ -448,8 +448,12 @@ namespace SmartDiceRolls {
         }
 
         // TODO: make the patch a separate function
-        int total = static_cast<int>(keptDie) + session.modifier;
-        bool success = total >= static_cast<int>(session.dc);
+        // The original call already ran and wrote finalTotal = virtualDie + modifier + bonuses
+        // (Guidance, Bless, Bardic Inspiration, etc. selected by the player after the prompt).
+        // Derive the non-die component from that so we don't lose anything the player picked.
+        const int modifierAndBonuses = rollState->finalTotal - rollState->keptNaturalRoll;
+        const int total = static_cast<int>(keptDie) + modifierAndBonuses;
+        const bool success = total >= static_cast<int>(session.dc);
 
         rollState->keptNaturalRoll = keptDie;
         rollState->otherNaturalRoll = otherDie;
@@ -457,7 +461,7 @@ namespace SmartDiceRolls {
 
         rollState->finalKeptDie = static_cast<uint8_t>(keptDie);
         rollState->finalOtherDie = static_cast<uint8_t>(otherDie);
-        rollState->finalModifier = static_cast<uint8_t>(session.modifier);
+        // finalModifier already set correctly by the original call — leave it
         rollState->finalSuccess = success ? 1 : 0;
 
 
