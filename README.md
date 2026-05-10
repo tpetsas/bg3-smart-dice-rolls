@@ -36,6 +36,17 @@ Installer: [**BG3-SmartDiceRolls-Mod_Setup.exe**][installer-link]
 - USB controller connectivity is recommended for best stability
 - Tray app closes automatically when the game exits
 
+
+<figure style="text-align:center;">
+  <div>
+  <img
+    src="installer/assets/bg3-dice-demo.gif"
+    alt="BG3 Smart Dice Rolls in action"
+    style="max-width:80%; height:auto;">
+  </div>
+    <em>BG3 Smart Dice Rolls Mod in action!</em>
+</figure>
+
 ## Installation
 
 [BG3 Smart Dice Rolls Mod (latest)]: https://github.com/tpetsas/bg3-smart-dice-rolls/releases/latest
