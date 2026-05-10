@@ -145,11 +145,11 @@ Setting `debug=true` enables verbose logging to `mods\smart-dice-rolls.log` (mod
 
 - **DualSense (PS5)**: Input is injected directly into the HID stream. Works wired or wireless; USB is recommended.
 - **Xbox**: Input is injected via a synthetic raw-input report. USB is recommended.
-- **Mouse & keyboard (no controller)**: The tray app performs a mouse click on the die graphic automatically — no controller is needed.
+- **Mouse & keyboard (no controller)**: This is supported as well.
 - **Co-op**: Multiple controllers are supported simultaneously.
 
 > [!NOTE]
-> USB connectivity is strongly recommended over Bluetooth for controllers. Wireless controller input can introduce latency that interferes with the roll injection timing.
+> USB connectivity is strongly recommended over Bluetooth for controllers. Wireless controller input can interfere with BLE bluetooth and affect the roll injection timing.
 
 ## Bluetooth Adapter Note
 
@@ -160,6 +160,11 @@ The solution was to **uninstall the Realtek Bluetooth drivers and disable the on
 <img width="491" alt="bluetooth-adapter-fix" src="installer/assets/smart-dice-installation-steps/bt-I-disabled-the-systems-one-realtek-from-both-bluetooth-and-network-adapters-and-I-installed-asus-usb-bt500-for-stability.png" />
 
 If you experience Pixels dice connectivity issues, switching to a USB Bluetooth adapter (such as the ASUS USB-BT500) is the recommended fix.
+
+## Other things to note
+
+> [!CAUTION]
+> The Pixels dice are turned off when they are close to magnets. This is expected as this is the main mechanism used by their charging case to turn off. So beware if you use them with a dice tray that contains magnets; I myself faced connectivity issues by rolling the dice in a magnetic dice tray and was confused about that. But as I said, this is an expected behavior by Pixel's firmware.
 
 ## Issues
 
