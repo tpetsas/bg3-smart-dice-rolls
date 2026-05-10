@@ -128,6 +128,21 @@ To uninstall the mod, go to **Settings > Add or remove programs**, locate **Bald
 
 Once installed, the mod activates automatically when Baldur's Gate 3 is started. The companion tray app (`PixelsTray.exe`) launches alongside the game and shows live die status, recent rolls, and battery levels.
 
+> [!IMPORTANT]
+> **Steam Input must be disabled!** This is a native mod that is relying on a system library (`input1_4.dll`) to attach to the game. This means that Steam Input **must** be disabled, or otherwise the mod will not get loaded.
+
+<p align="center">
+  <br><br>
+  <img
+    src="https://github.com/user-attachments/assets/8be5c4bf-9064-403e-b7f5-9a868a2aacc9"
+    alt="BG3 Smart Dice Rolls in action"
+    width="90%">
+  <br>
+  <em>Steam Input must be disabled for the mod to work</em>
+</p>
+
+This is totally fine, as Baldur's Gate 3 has great native support for most the controllers out there.
+
 ### Configuration file
 
 The mod can be configured via an INI file located at `<game>\mods\smart-dice-rolls-mod.ini`.
