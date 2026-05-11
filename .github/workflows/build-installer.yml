@@ -1,0 +1,165 @@
+name: Build and Package Mod
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Install Inno Setup
+      run: choco install innosetup -y
+
+    - name: Configure CMake
+      run: |
+        mkdir build
+        cd build
+        cmake .. -G "Visual Studio 17 2022"
+
+    - name: Build Project (Release)
+      run: |
+        cd build
+        cmake --build . --config Release
+
+    - name: List Release outputs (debugging)
+      shell: pwsh
+      run: |
+        Get-ChildItem -Recurse -File build |
+          Where-Object { $_.FullName -match "\\Release\\" -and $_.Extension -in ".dll",".exe",".lib" } |
+          Select-Object FullName, Length |
+          Format-Table -AutoSize
+
+    - name: Verify no Debug CRT dependencies (Release)
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (!(Test-Path $vswhere)) { throw "vswhere.exe not found" }
+
+        $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if (!$vsInstall) { throw "Visual Studio with C++ tools not found" }
+
+        $dumpbin = Get-ChildItem "$vsInstall\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe |
+                   Where-Object { $_.FullName -match "Hostx64\\x64" } |
+                   Select-Object -First 1
+
+        if (!$dumpbin) { throw "dumpbin.exe not found under $vsInstall" }
+
+        Write-Host "Using dumpbin: $($dumpbin.FullName)"
+
+        $bins = Get-ChildItem -Recurse -File build |
+          Where-Object { $_.FullName -match "\\Release\\" -and $_.Extension -in ".dll",".exe" }
+
+        if ($bins.Count -eq 0) { throw "No Release exe/dll found under build to verify." }
+
+        foreach($b in $bins) {
+          $deps = & $dumpbin.FullName /dependents $b.FullName | Out-String
+          if ($deps -match "VCRUNTIME140D\.dll|MSVCP140D\.dll|VCRUNTIME140_1D\.dll|ucrtbased\.dll") {
+            Write-Host "---- $($b.FullName) ----"
+            Write-Host $deps
+            throw "❌ Debug CRT dependency detected in Release binary: $($b.Name)"
+          }
+        }
+
+        Write-Host "✅ No Debug CRT dependencies detected in Release binaries."
+
+    - name: Copy Built Files to Installer Directory
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force installer\files | Out-Null
+
+        function Find-ReleaseFile($name) {
+          $f = Get-ChildItem -Recurse -File build -Filter $name |
+               Where-Object { $_.FullName -match "\\Release\\" } |
+               Select-Object -First 1
+          if (!$f) { throw "Could not find $name under build\**\Release\**" }
+          return $f.FullName
+        }
+
+        $modDll   = Find-ReleaseFile "smart-dice-rolls.dll"
+        $trayExe  = Find-ReleaseFile "PixelsTray.exe"
+        $proxyDll = Find-ReleaseFile "xinput1_4.dll"
+
+        Copy-Item $modDll   installer\files\ -Force
+        Copy-Item $trayExe  installer\files\ -Force
+        Copy-Item $proxyDll installer\files\ -Force
+
+        Write-Host "Copied:"
+        Write-Host "  smart-dice-rolls.dll from $modDll"
+        Write-Host "  PixelsTray.exe       from $trayExe"
+        Write-Host "  xinput1_4.dll        from $proxyDll"
+
+    - name: Build Inno Setup Installer
+      run: |
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\BG3SmartDiceRollsModInstaller.iss
+
+    - name: Upload Installer EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: Installer
+        path: installer/BG3-SmartDiceRolls-Mod_Setup.exe
+        if-no-files-found: error
+
+    - name: Prepare Manual Install ZIP
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force manual-install\mods\PixelsDiceTray | Out-Null
+        Copy-Item installer\files\xinput1_4.dll             manual-install\
+        Copy-Item installer\files\smart-dice-rolls.dll      manual-install\mods\
+        Copy-Item installer\files\smart-dice-rolls-mod.ini  manual-install\mods\
+        Copy-Item installer\files\PixelsTray.exe            manual-install\mods\PixelsDiceTray\
+        Copy-Item installer\files\pixels.ini                manual-install\mods\PixelsDiceTray\
+        Compress-Archive -Path manual-install\* -DestinationPath BG3-SmartDiceRolls-Mod_Binaries.zip
+
+    - name: Upload Manual Install ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: Binaries
+        path: BG3-SmartDiceRolls-Mod_Binaries.zip
+        if-no-files-found: error
+
+    - name: Upload to GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: "BG3 Smart Dice Rolls Mod ${{ github.ref_name }}"
+        files: |
+          installer/BG3-SmartDiceRolls-Mod_Setup.exe
+          BG3-SmartDiceRolls-Mod_Binaries.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Verify shipped binaries do not depend on Debug CRT
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $dumpbin = Get-ChildItem "$vsInstall\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe |
+                   Where-Object { $_.FullName -match "Hostx64\\x64" } |
+                   Select-Object -First 1
+
+        $bins = Get-ChildItem -File installer\files\* |
+          Where-Object { $_.Extension -in ".dll",".exe" }
+
+        foreach($b in $bins) {
+          $deps = & $dumpbin.FullName /dependents $b.FullName | Out-String
+          if ($deps -match "VCRUNTIME140D\.dll|MSVCP140D\.dll|VCRUNTIME140_1D\.dll|ucrtbased\.dll") {
+            Write-Host "---- $($b.FullName) ----"
+            Write-Host $deps
+            throw "❌ Debug CRT dependency detected in shipped file: $($b.Name)"
+          }
+        }
+
+        Write-Host "✅ All shipped binaries in installer\files are clean."
