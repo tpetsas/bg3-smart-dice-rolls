@@ -21,7 +21,7 @@ This mod hooks into Baldur's Gate 3's dialogue roll system and bridges it with p
 
 The mod works with **mouse & keyboard**, **DualSense (PS5)**, and **Xbox** controllers, and supports **co-op** play.
 
-Mod Page: [**Nexus Mods — BG3 Smart Dice Rolls Mod**](https://www.nexusmods.com/baldursgate3/mods/TODO/)
+Mod Page: [**Nexus Mods — BG3 Smart Dice Rolls Mod**](https://www.nexusmods.com/games/baldursgate3/mods/22797)
 
 Installer: [**BG3-SmartDiceRolls-Mod_Setup.exe**][installer-link]
 
