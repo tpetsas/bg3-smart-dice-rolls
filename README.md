@@ -52,11 +52,32 @@ Installer: [**BG3-SmartDiceRolls-Mod_Setup.exe**][installer-link]
 
 [BG3 Smart Dice Rolls Mod (latest)]: https://github.com/tpetsas/bg3-smart-dice-rolls/releases/latest
 
+### :exclamation: Windows SmartScreen or Antivirus Warning
+
+If Windows or your antivirus flags this installer or executable, it's most likely because the file is **not digitally signed**.
+
+This is a known limitation affecting many **open-source projects** that don't use paid code-signing certificates.
+
+#### :white_check_mark: What you should know:
+- This mod is **open source**, and you can inspect the full source code here on GitHub.
+- It **does not contain malware or spyware**.
+- Some antivirus programs may incorrectly flag unsigned software — these are known as **false positives**.
+
 Download the [BG3-SmartDiceRolls-Mod_Setup.exe][installer-link] from the latest version ([BG3 Smart Dice Rolls Mod (latest)])
 
 Double click the installer to run it:
 
 <img width="491" alt="click-on-the-installer" src="installer/assets/smart-dice-installation-steps/1-click-on-the-installer.png" />
+
+You may safely proceed by clicking:
+
+> **More info → Run anyway** (for SmartScreen)  
+> or temporarily allow the file in your antivirus software.
+>
+> If for any reason the "Run anyway" button is missing you can just do the process manually by:  
+> Right-click BG3-SmartDiceRolls-Mod_Setup.exe → Properties → Check "Unblock" → Apply
+
+<img width="491" alt="unlock" src="https://github.com/user-attachments/assets/6d07b38e-927f-4219-a770-4c0819f4d646" />
 
 Accept the disclaimer and click Next:
 
