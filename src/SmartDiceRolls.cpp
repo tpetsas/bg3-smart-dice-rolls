@@ -121,27 +121,6 @@ static_assert(offsetof(DialogueRollState, keptNaturalRoll) == 0xCC);
 static_assert(offsetof(DialogueRollState, otherNaturalRoll) == 0xD0);
 // Game functions
 
-/*
-void FUN_1410acc10(longlong *param_1,undefined8 param_2,undefined8 param_3,undefined4 param_4)
-
-{
-  undefined4 uVar1;
-  longlong local_18;
-  undefined8 local_10;
-
-  FUN_144d58130(*(undefined8 *)(param_1[1] + 0x30));
-  local_18 = *param_1;
-  local_10 = *(undefined8 *)(local_18 + 8);
-  FUN_140f05e30(&local_18,param_2);
-  uVar1 = FUN_144d57970(*(undefined8 *)(param_1[1] + 0x30),param_4);
-  FUN_144d58700(*(undefined8 *)(param_1[1] + 0x30),"NaturalRoll",0xb);
-  FUN_144d58130(*(undefined8 *)(param_1[1] + 0x30));
-  FUN_144d58b90(*(undefined8 *)(param_1[1] + 0x30),0xfffffffe,1);
-  FUN_144d58e30(*(undefined8 *)(param_1[1] + 0x30),uVar1);
-  return;
-}
-*/
-
 using _ResolveDialogueRoll = void(__fastcall*)( //FUN_14328e080
     int64_t rollContext,        // param_1
     int64_t* ecsOrClientCtx,    // param_2
@@ -234,66 +213,6 @@ namespace SmartDiceRolls {
         }
     }
 
-#if 0
-    void ResolveDialogueRoll_Hook (
-        int64_t rollContext, int64_t* ecsOrClientCtx,
-        int64_t rollState, char isReplayOrUiFlag) {
-
-        _LOG("ResolveDialogueRoll Hook!");
-
-        // observed / likely
-        // +0x40  adv/disadv selector enum
-        // +0x41  difficultyClass
-        // +0x42  finalKeptDieCompact
-        // +0x43  finalOtherDieCompact
-        // +0x44  finalModifierCompact
-        // +0x4C  finalSuccess
-        // +0x54  roll mode/type
-        // +0x88  uiReplayFlag
-        // +0xAC  modifier
-        // +0xB5  advFlagResolved
-        // +0xB6  disFlagResolved
-        // +0xC8  finalTotal
-        // +0xCC  keptNaturalRoll
-        // +0xD0  otherNaturalRoll
-
-        ResolveDialogueRoll_Original (
-            rollContext, ecsOrClientCtx,
-            rollState, isReplayOrUiFlag
-        );
-
-        // quick and dirty static patching
-        auto p = reinterpret_cast<uint8_t*>(rollState);
-
-        int dc       = *(uint8_t*)(p + 0x41);
-        int modifier = *reinterpret_cast<int*>(p + 0xAC);
-
-        int keptDie  = 1;
-        int otherDie = 4;
-        int total    = keptDie + modifier;
-        bool success = total >= dc;
-
-        uint8_t rawMode = *(p + 0x40);
-        RollMode mode = GetModeFromRollState(p);
-
-        *reinterpret_cast<int*>(p + 0xCC) = keptDie;
-        *reinterpret_cast<int*>(p + 0xD0) = otherDie;
-        *reinterpret_cast<int*>(p + 0xC8) = total;
-
-        *(p + 0x42) = static_cast<uint8_t>(keptDie);
-        *(p + 0x43) = static_cast<uint8_t>(otherDie);
-        *(p + 0x44) = static_cast<uint8_t>(modifier);
-        *(p + 0x4C) = success ? 1 : 0;
-
-        _LOG (
-            "[Dialogue Roll] rawMode: %u, mode:%s, dc: %d, modifier: %d, kept die: %d, other die: %d, "
-            "total: %d, result: %s",
-            static_cast<unsigned>(rawMode),
-            RollModeName(mode),
-            dc, modifier, keptDie, otherDie, total, success ? "success" : "failure"
-        );
-    }
-#endif
 
 
     static RollMode GetModeFromRawMode(uint8_t rawMode)
@@ -313,6 +232,7 @@ namespace SmartDiceRolls {
         char isReplayOrUiFlag)
     {
 
+    #if 0
     // Log call stack when the dice roll is triggered (flag=0)
     if (isReplayOrUiFlag == 0) {
         void* stack[32];
@@ -324,6 +244,7 @@ namespace SmartDiceRolls {
             _LOG("[CallStack]   [%u] addr=%p  RVA=+0x%llX", i, stack[i], (unsigned long long)rva);
         }
     }
+    #endif
 
     ResolveDialogueRoll_Original(
         rollContext,
@@ -475,45 +396,6 @@ namespace SmartDiceRolls {
 
         ResetDialogueRollSession();
     }
-
-
-
-
-#if 0
-_LOG("[ResolveRoll] ctx=%p state=%p uiFlag=%d rawMode=%u dc=%u mod=%d",
-    (void*)rollContext,
-    (void*)rollStatePtr,
-    (int)isReplayOrUiFlag,
-    (unsigned)rollState->rawMode,
-    (unsigned)rollState->difficultyClass,
-    (int)rollState->modifier);
-    return;
-
-
-    int dc = rollState->difficultyClass;
-    int modifier = rollState->modifier;
-    RollMode mode = GetModeFromRawMode(rollState->rawMode);
-
-    //int keptDie = 1;
-    //int otherDie = 4;
-    //int total = keptDie + modifier;
-    //bool success = total >= dc;
-
-    rollState->keptNaturalRoll = keptDie;
-    rollState->otherNaturalRoll = otherDie;
-    rollState->finalTotal = total;
-
-    rollState->finalKeptDie = static_cast<uint8_t>(keptDie);
-    rollState->finalOtherDie = static_cast<uint8_t>(otherDie);
-    rollState->finalModifier = static_cast<uint8_t>(modifier);
-    rollState->finalSuccess = success ? 1 : 0;
-
-    _LOG("[Dialogue Roll] rawMode:%u mode:%s dc:%d modifier:%d kept:%d other:%d total:%d result:%s",
-        static_cast<unsigned>(rollState->rawMode),
-        RollModeName(mode),
-        dc, modifier, keptDie, otherDie, total,
-        success ? "success" : "failure");
-#endif
 }
 
     bool InitAddresses() {
