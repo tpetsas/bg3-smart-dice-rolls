@@ -168,7 +168,7 @@ This is totally fine, as Baldur's Gate 3 has great native support for most the c
 
 The mod can be configured via an INI file located at `<game>\mods\smart-dice-rolls-mod.ini`.
 
-A sample configuration:
+#### `[app]`
 
 ```ini
 [app]
@@ -176,6 +176,21 @@ debug=false
 ```
 
 Setting `debug=true` enables verbose logging to `mods\smart-dice-rolls.log` (mod DLL) and `mods\PixelsDiceTray\pixels_log.txt` (tray app). Leave it at `false` in normal use.
+
+#### `[display]`
+
+```ini
+[display]
+click_norm_x=0.50
+click_norm_y=0.43
+```
+
+These control where the tray app clicks the dice roll button when using **mouse & keyboard** (no controller). The values are normalized positions within the game window (0.0 = left/top, 1.0 = right/bottom). The defaults are calibrated for a **16:9** display at default UI scale.
+
+If the click lands off-target on your setup, adjust these values until it hits the dice button. The advantage/disadvantage X position is derived automatically as `click_norm_x - 0.03`.
+
+> [!TIP]
+> To calibrate: temporarily disconnect your Pixels dice so the tray app never receives a roll result. Trigger a dialogue roll in-game — the button will appear but the tray app won't click it. While the button is visible, hover your cursor over it and use a screen coordinate tool (e.g. the free [WinSpy](https://github.com/strobejb/winspy) or any cursor-position utility) to read the cursor's screen coordinates. Then divide by your game window dimensions: `click_norm_x = cursorX / windowWidth`, `click_norm_y = cursorY / windowHeight`.
 
 ### Controller support notes
 
