@@ -91,13 +91,13 @@ Once all steps are completed, you will reach the final screen indicating that th
 
 <img width="491" alt="click-finish" src="installer/assets/smart-dice-installation-steps/5-click-finish.png" />
 
-Then, the first time you install the mod, you need to configure your dice with the PixelTray app. This step should only happens once and then the TrayApp will remember your dice. To do that, find the PixelsTray app. This should be in the `bin` directory of the game at `mods\PixelsDiceTray` path (e.g., if the game is installed from Steam, this path should be: `C:\Program Files (x86)\Steam\steamapps\common\Baldurs Gate 3\bin\mods\PixelsDiceTray`).
+Then, the first time you install the mod, you need to configure your dice with the PixelsTray app. This step should only happen once and then the TrayApp will remember your dice. To do that, find the PixelsTray app. This should be in the `bin` directory of the game at `mods\PixelsDiceTray` path (e.g., if the game is installed from Steam, this path should be: `C:\Program Files (x86)\Steam\steamapps\common\Baldurs Gate 3\bin\mods\PixelsDiceTray`).
 
-So, Find and run the `PixelsTray` app from the game's `mods\PixelsDiceTray\` folder:
+So, find and run the `PixelsTray` app from the game's `mods\PixelsDiceTray\` folder:
 
 <img width="491" alt="run-pixelstray" src="installer/assets/smart-dice-installation-steps/6-find-and-run-the-pixelstray-app.png" />
 
-It will show that no dice configuration is found and prompt you to setup your dice. Just click "OK":
+It will show that no dice configuration is found and prompt you to set up your dice. Just click "OK":
 
 <img width="491" alt="setup-pixels-config" src="installer/assets/smart-dice-installation-steps/7-the-first-time-you-need-to-setup-pixels-dice-config-click-ok.png" />
 
@@ -105,7 +105,7 @@ Then, wait for the app to scan and find all of your dice, and then click "Save S
 
 <img width="491" alt="save-setup" src="installer/assets/smart-dice-installation-steps/8-wait-for-the-to-find-all-of-your-dice-and-click-save-setup.png" />
 
-After this step, a Pixels configuration file (`pixels.cfg`) should be created in the same directory that will be used now on from the mod each time that the game starts:
+After this step, a Pixels configuration file (`pixels.cfg`) should be created in the same directory that will be used from now on by the mod each time the game starts:
 
 <img width="491" alt="config-file-created" src="installer/assets/smart-dice-installation-steps/10-this-will-create-the-pixels-config-file-dot-cfg.png" />
 
@@ -162,7 +162,7 @@ Once installed, the mod activates automatically when Baldur's Gate 3 is started.
   <em>Steam Input must be disabled for the mod to work</em>
 </p>
 
-This is totally fine, as Baldur's Gate 3 has great native support for most the controllers out there.
+This is totally fine, as Baldur's Gate 3 has great native support for most of the controllers out there.
 
 ### Configuration file
 
@@ -200,7 +200,7 @@ If the click lands off-target on your setup, adjust these values until it hits t
 - **Co-op**: Multiple controllers are supported simultaneously.
 
 > [!NOTE]
-> USB connectivity is strongly recommended over Bluetooth for controllers. Wireless controller input can interfere with BLE bluetooth and affect the roll injection timing.
+> USB connectivity is strongly recommended over Bluetooth for controllers. Wireless controller input can interfere with BLE and affect the roll injection timing.
 
 ## Bluetooth Adapter Note
 
