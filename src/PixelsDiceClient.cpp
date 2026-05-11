@@ -270,6 +270,23 @@ static bool requestRoll(const char* mode, uint32_t generation, SmartDiceResult& 
     return true;
 }
 
+// Ask the tray app to click the dice button. Called after g_smartDiceResult is set,
+// so the hook is ready before the game processes the click.
+static bool requestClick(const char* mode)
+{
+    char json[128];
+    snprintf(json, sizeof(json), "{\"action\": \"click\", \"mode\": \"%s\"}", mode);
+    _LOG("[PipeClient] Sending click: %s", json);
+    std::string response;
+    if (!sendAndReceive(json, response))
+    {
+        _LOG("[PipeClient] Click request failed");
+        return false;
+    }
+    _LOG("[PipeClient] Click response: %s", response.c_str());
+    return true;
+}
+
 // NOTE: mouse click logic has been moved to the tray app (clickBG3DiceButton in TrayApp.cpp).
 // Clicking from an external process correctly handles all window modes (fullscreen, borderless,
 // windowed), whereas doing it from inside the BG3 process caused misses in windowed mode.
@@ -1055,8 +1072,9 @@ static void pipeListenerThread()
                 _LOG("[PipeClient] Roll result ready: gen=%u die1=%u die2=%u",
                     result.generation, result.die1, result.die2);
 
-                // trigger the dice roll via controller injection; for mouse & keyboard the
-                // tray app already clicked the button as part of sending the response.
+                // trigger the dice roll: controller injection or tray-app click.
+                // g_smartDiceResult is already set above, so the hook is armed
+                // before either path causes the game to call ResolveDialogueRoll.
                 if (g_hasHidController.load(std::memory_order_relaxed))
                 {
                     _LOG("[PipeClient] Controller detected — using triangle injection");
@@ -1064,7 +1082,8 @@ static void pipeListenerThread()
                 }
                 else
                 {
-                    _LOG("[PipeClient] No controller — tray app handled the click");
+                    _LOG("[PipeClient] No controller — asking tray app to click");
+                    requestClick(mode.c_str());
                 }
             }
             // else: server returned an error (e.g. timeout) — pipe is fine, just skip

@@ -567,7 +567,7 @@ _LOG("[ResolveRoll] ctx=%p state=%p uiFlag=%d rawMode=%u dc=%u mod=%d",
     void Init() {
         g_logger.Open("./mods/smart-dice-rolls.log");
         _LOG(
-            "Baldur's Gate 3 Smart Dice Rolls Mod v1.0 by Thanos Petsas (SkyExplosionist)");
+            "Baldur's Gate 3 Smart Dice Rolls Mod v1.1 by Thanos Petsas (SkyExplosionist)");
         g_bg3BaseAddr = GetModuleHandle(NULL);
         g_base = reinterpret_cast<uintptr_t>(g_bg3BaseAddr);
         _LOG("Module base: %p (g_base=%p)", g_bg3BaseAddr, (void*)g_base);
